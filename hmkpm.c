@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
+/*
+ * KernelPatch Module (KPM) - Ghost Channel Edition
+ * 融合 HuntMemory-KPM 的页表遍历 + do_mem_abort 隐蔽通信
+ */
+
 #include <asm/current.h>
 #include <common.h>
 #include <compiler.h>
@@ -15,7 +20,7 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/printk.h>
-#include <linux/string.h>   // 修复: strstr 缺失
+#include <linux/string.h>
 #include <asm/ptrace.h>
 #include <asm-generic/rwonce.h>
 
@@ -27,10 +32,10 @@
 #endif
 
 KPM_NAME("HMKPM");
-KPM_VERSION("1.1.0");
+KPM_VERSION("1.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Fusion");
-KPM_DESCRIPTION("Ghost Channel Memory R/W & Module Base");
+KPM_DESCRIPTION("Ghost Channel Memory R/W");
 
 #define HMKPM_TAG "[HMKPM] "
 #define hmkpm_info(fmt, ...)        logki(HMKPM_TAG fmt, ##__VA_ARGS__)
@@ -42,7 +47,6 @@ KPM_DESCRIPTION("Ghost Channel Memory R/W & Module Base");
 
 #define HMKPM_MAGIC_READ        0x101
 #define HMKPM_MAGIC_WRITE       0x102
-#define HMKPM_MAGIC_MODULE_BASE 0x103
 
 struct hmkpm_req {
     int32_t pid;
@@ -51,15 +55,11 @@ struct hmkpm_req {
     uint64_t size;
 };
 
-struct hmkpm_module_req {
-    int32_t pid;
-    char module_name[256];
-};
 // ----------------------------------------------------
 
 static bool hook_active = true;
-static int mmap_lock_sem_offset = 112;
 
+// 需要动态解析的内核符号
 void *kfunc_def(memset)(void *s, int c, size_t count);
 unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
 unsigned long kfunc_def(__arch_copy_from_user)(void *to, const void __user *from, unsigned long n);
@@ -69,9 +69,6 @@ struct mm_struct *kfunc_def(get_task_mm)(struct task_struct *task);
 void kfunc_def(mmput)(struct mm_struct *mm);
 void kfunc_def(__rcu_read_lock)(void);
 void kfunc_def(__rcu_read_unlock)(void);
-void kfunc_def(down_read)(void *sem);
-void kfunc_def(up_read)(void *sem);
-char *kfunc_def(strstr)(const char *s1, const char *s2); // 动态解析 strstr
 
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
@@ -82,6 +79,7 @@ static unsigned long hmkpm_lookup_symbol(const char *name)
     return kallsyms_lookup_name(name);
 }
 
+// 自定义内存拷贝
 static inline void hmkpm_memcpy(void *dst, const void *src, size_t n)
 {
     uint8_t *d = (uint8_t *)dst;
@@ -90,7 +88,7 @@ static inline void hmkpm_memcpy(void *dst, const void *src, size_t n)
     while (n > 0) { *d++ = *s++; n--; }
 }
 
-// 页表遍历相关
+// 页表遍历相关全局变量
 static uint64_t pgt_va_bits, pgt_phys_offset, pgt_page_offset, pgt_linear_voffset;
 static uint64_t pgt_page_shift, pgt_page_size, pgt_pgd_align_mask, pgt_pgd_size;
 static uint64_t pgt_page_level, pgt_user_limit, pgt_high_memory;
@@ -196,7 +194,7 @@ static int pgt_pgtable_init(void)
     return 0;
 }
 
-// ----------------- 核心读写功能 -----------------
+// ----------------- 核心读写功能（彻底去除锁） -----------------
 static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, void __user *local_buf, bool is_write)
 {
     ssize_t total = 0;
@@ -212,11 +210,11 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
         chunk = min(chunk, (size_t)sizeof(bounce));
 
         if (is_write && kfunc(__arch_copy_from_user)(bounce, local_buf, chunk) != 0) break;
-        if (kf_down_read) kfunc(down_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
+
+        // ★ 彻底去掉了这里容易导致小米内核崩溃的 down_read 加锁
 
         uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, remote_va, is_write);
         if (!tkpa) {
-            if (kf_up_read) kfunc(up_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
             if (total > 0) break;
             return -EFAULT;
         }
@@ -225,7 +223,8 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
         if (is_write) hmkpm_memcpy(tkva, bounce, chunk);
         else hmkpm_memcpy(bounce, tkva, chunk);
 
-        if (kf_up_read) kfunc(up_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
+        // ★ 彻底去掉了这里的 up_read 解锁
+
         if (!is_write && kfunc(__arch_copy_to_user)(local_buf, bounce, chunk) != 0) break;
 
         total += chunk; local_buf = (void __user *)((uintptr_t)local_buf + chunk);
@@ -255,55 +254,6 @@ static long hmkpm_do_rw(void __user *req_ptr, void __user *data_ptr, uint64_t ma
     return (ret == (long)req.size) ? 0 : -EFAULT;
 }
 
-// ----------------- 模块基址查询功能 (基于指针偏移) -----------------
-static long hmkpm_get_module_base(void __user *req_ptr, void __user *out_base_ptr)
-{
-    struct hmkpm_module_req kreq;
-    struct task_struct *task = NULL;
-    struct mm_struct *mm = NULL;
-    unsigned long found_base = 0;
-
-    if (kfunc(__arch_copy_from_user)(&kreq, req_ptr, sizeof(kreq)) != 0) return -EFAULT;
-    if (kreq.pid <= 0 || kreq.module_name[0] == '\0') return -EINVAL;
-
-    kfunc(__rcu_read_lock)();
-    task = kfunc(find_task_by_vpid)(kreq.pid);
-    if (task) mm = kfunc(get_task_mm)(task);
-    kfunc(__rcu_read_unlock)();
-    if (!mm) return -ESRCH;
-
-    // 修复: 放弃使用编译器不认识的结构体成员，直接使用 GKI 标准偏移量
-    unsigned long vma = *(unsigned long *)((unsigned long)mm + 0x0); // mm->mmap (偏移 0x0)
-    
-    if (kf_down_read) kfunc(down_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
-
-    while (vma) {
-        unsigned long vm_start = *(unsigned long *)(vma + 0x0);  // vm_start (偏移 0x0)
-        unsigned long vm_file  = *(unsigned long *)(vma + 0x90); // vm_file (偏移 0x90)
-        
-        if (vm_file) {
-            // 修复: file->f_path.dentry (偏移 0x18)
-            unsigned long dentry = *(unsigned long *)(vm_file + 0x18); 
-            if (dentry) {
-                // 修复: dentry->d_name.name (偏移 0x28)
-                char *name = *(char **)(dentry + 0x28);
-                if (name && kf_strstr && kf_strstr(name, kreq.module_name) != NULL) {
-                    found_base = vm_start;
-                    break;
-                }
-            }
-        }
-        // 修复: vm_next (偏移 0x10)
-        vma = *(unsigned long *)(vma + 0x10); 
-    }
-
-    if (kf_up_read) kfunc(up_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
-    kfunc(mmput)(mm);
-
-    if (kfunc(__arch_copy_to_user)(out_base_ptr, &found_base, sizeof(found_base)) != 0) return -EFAULT;
-    return 0;
-}
-
 // ----------------- 缺页异常拦截通道 -----------------
 static void before_do_mem_abort(hook_fargs3_t *args, void *udata)
 {
@@ -323,8 +273,6 @@ static void before_do_mem_abort(hook_fargs3_t *args, void *udata)
 
     if (magic == HMKPM_MAGIC_READ || magic == HMKPM_MAGIC_WRITE) {
         regs->regs[0] = (uint64_t)hmkpm_do_rw(req_ptr, data_ptr, magic);
-    } else if (magic == HMKPM_MAGIC_MODULE_BASE) {
-        regs->regs[0] = (uint64_t)hmkpm_get_module_base(req_ptr, data_ptr);
     }
 
     regs->pc += 4;
@@ -342,11 +290,8 @@ static long module_init_handler(const char *args, const char *event, void *__use
     kf_mmput = (typeof(kf_mmput))hmkpm_lookup_symbol("mmput");
     kf___rcu_read_lock = (typeof(kf___rcu_read_lock))hmkpm_lookup_symbol("__rcu_read_lock");
     kf___rcu_read_unlock = (typeof(kf___rcu_read_unlock))hmkpm_lookup_symbol("__rcu_read_unlock");
-    kf_down_read = (typeof(kf_down_read))hmkpm_lookup_symbol("down_read");
-    kf_up_read = (typeof(kf_up_read))hmkpm_lookup_symbol("up_read");
-    kf_strstr = (typeof(kf_strstr))hmkpm_lookup_symbol("strstr"); // 解析 strstr
 
-    if (!kf___arch_copy_to_user || !kf___arch_copy_from_user || !kf_find_task_by_vpid || !kf_strstr) return -ENOENT;
+    if (!kf___arch_copy_to_user || !kf___arch_copy_from_user || !kf_find_task_by_vpid) return -ENOENT;
 
     unsigned long do_mem_abort_addr = hmkpm_lookup_symbol("do_mem_abort");
     if (!do_mem_abort_addr) return -ENOENT;
@@ -354,7 +299,7 @@ static long module_init_handler(const char *args, const char *event, void *__use
     hook_err_t err = hook_wrap3((void *)do_mem_abort_addr, before_do_mem_abort, 0, 0);
     if (err) return -ENOENT;
 
-    hmkpm_info("Ghost Channel Full Edition Loaded.\n");
+    hmkpm_info("Ghost Channel Pure Edition Loaded.\n");
     return 0;
 }
 
