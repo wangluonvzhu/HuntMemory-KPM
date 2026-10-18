@@ -20,10 +20,23 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/printk.h>
+#include <linux/string.h>   // 修复: 解决 memcpy 隐式声明
+#include <linux/rwsem.h>    // 修复: 解决 rw_semaphore 类型问题
 #include <asm/ptrace.h>
 #include <asm-generic/rwonce.h>
 
-KPM_NAME("HMKPM_GHOST");
+// 修复: 补充缺失的宏定义
+#ifndef U64_MAX
+#define U64_MAX ((u64)~0ULL)
+#endif
+#ifndef min
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+// 修复: 显式前向声明，避免结构体冲突
+struct rw_semaphore;
+
+KPM_NAME("HMKPM");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Fusion");
@@ -49,7 +62,7 @@ struct hmkpm_req {
 // ----------------------------------------------------
 
 static bool hook_active = true;
-static int mmap_lock_sem_offset = -1;
+static int mmap_lock_sem_offset = 112; // Kernel 5.10 标准 GKI 偏移量固定为 112
 
 // 需要动态解析的内核符号
 void *kfunc_def(memset)(void *s, int c, size_t count);
@@ -61,8 +74,10 @@ struct mm_struct *kfunc_def(get_task_mm)(struct task_struct *task);
 void kfunc_def(mmput)(struct mm_struct *mm);
 void kfunc_def(__rcu_read_lock)(void);
 void kfunc_def(__rcu_read_unlock)(void);
-void kfunc_def(down_read)(struct rw_semaphore *sem);
-void kfunc_def(up_read)(struct rw_semaphore *sem);
+
+// 修复: 将指针参数改为 void * 以兼容 KPM 宏的强类型匹配
+void kfunc_def(down_read)(void *sem);
+void kfunc_def(up_read)(void *sem);
 
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
@@ -190,7 +205,7 @@ static int pgt_pgtable_init(void)
     pgt_linear_voffset = pgt_page_offset - pgt_phys_offset;
 
     kv_high_memory = (typeof(kv_high_memory))hmkpm_lookup_symbol("high_memory");
-    pgt_high_memory = kv_high_memory ? *(u64 *)kv_high_memory : ~0ULL;
+    pgt_high_memory = kv_high_memory ? *(u64 *)kv_high_memory : U64_MAX;
     return 0;
 }
 
@@ -203,11 +218,9 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
     uint8_t bounce[512]; // 栈上缓冲
 
     if (!mm) return -ESRCH;
-    if (*(u64 *)((uintptr_t)mm + mm_struct_offset.pgd_offset) == 0) { // 快速校验
-        if (kfunc(copy_from_kernel_nofault)(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(pgd)) != 0 || !pgd)
-            return -EFAULT;
-    } else {
-        pgd = *(u64 *)((uintptr_t)mm + mm_struct_offset.pgd_offset);
+    
+    if (kfunc(copy_from_kernel_nofault)(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(pgd)) != 0 || !pgd) {
+        return -EFAULT;
     }
 
     while (len > 0) {
@@ -219,13 +232,14 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
             if (kfunc(__arch_copy_from_user)(bounce, local_buf, chunk) != 0) break;
         }
 
-        if (mmap_lock_sem_offset >= 0 && kf_down_read) {
-            kfunc(down_read)((struct rw_semaphore *)((uintptr_t)mm + mmap_lock_sem_offset));
+        if (kf_down_read) {
+            // 修复: 强制转换为 void * 规避类型检查
+            kfunc(down_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
         }
 
         uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, remote_va, is_write);
         if (!tkpa) {
-            if (mmap_lock_sem_offset >= 0 && kf_up_read) kfunc(up_read)((struct rw_semaphore *)((uintptr_t)mm + mmap_lock_sem_offset));
+            if (kf_up_read) kfunc(up_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
             if (total > 0) break;
             return -EFAULT;
         }
@@ -237,7 +251,7 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
             memcpy(bounce, tkva, chunk);
         }
 
-        if (mmap_lock_sem_offset >= 0 && kf_up_read) kfunc(up_read)((struct rw_semaphore *)((uintptr_t)mm + mmap_lock_sem_offset));
+        if (kf_up_read) kfunc(up_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
 
         if (!is_write) {
             if (kfunc(__arch_copy_to_user)(local_buf, bounce, chunk) != 0) break;
@@ -280,7 +294,7 @@ static void before_do_mem_abort(hook_fargs3_t *args, void *udata)
     unsigned long far = (unsigned long)args->arg0;
     struct pt_regs *regs = (struct pt_regs *)args->arg2;
 
-    // 快速过滤
+    // 快速过滤：如果不是我们的特征地址，或者是模块被关闭，直接返回
     if (likely((far & HMKPM_GHOST_MASK) != HMKPM_GHOST_PREFIX)) return;
     if (!READ_ONCE(hook_active)) return;
 
@@ -288,7 +302,7 @@ static void before_do_mem_abort(hook_fargs3_t *args, void *udata)
     void __user *req_ptr = (void __user *)regs->regs[1];
     void __user *data_ptr = (void __user *)regs->regs[2];
 
-    // 伪造成功，跳过内核原有 SIGSEGV 处理
+    // 伪造成功，跳过内核原有的 SIGSEGV 处理
     args->skip_origin = 1;
     args->ret = 0;
     regs->regs[0] = 0; // 默认返回值
@@ -313,6 +327,8 @@ static long module_init_handler(const char *args, const char *event, void *__use
     kf_mmput = (typeof(kf_mmput))hmkpm_lookup_symbol("mmput");
     kf___rcu_read_lock = (typeof(kf___rcu_read_lock))hmkpm_lookup_symbol("__rcu_read_lock");
     kf___rcu_read_unlock = (typeof(kf___rcu_read_unlock))hmkpm_lookup_symbol("__rcu_read_unlock");
+    
+    // 修复后的 down_read/up_read 类型强转
     kf_down_read = (typeof(kf_down_read))hmkpm_lookup_symbol("down_read");
     kf_up_read = (typeof(kf_up_read))hmkpm_lookup_symbol("up_read");
 
@@ -320,9 +336,6 @@ static long module_init_handler(const char *args, const char *event, void *__use
         hmkpm_error("Core symbols missing!\n");
         return -ENOENT;
     }
-
-    // Kernel 5.10 mm->mmap_lock 偏移量固定为 112
-    mmap_lock_sem_offset = 112;
 
     unsigned long do_mem_abort_addr = hmkpm_lookup_symbol("do_mem_abort");
     if (!do_mem_abort_addr) {
@@ -344,6 +357,7 @@ static long module_cleanup_handler(void *__user reserved)
 {
     unsigned long do_mem_abort_addr = hmkpm_lookup_symbol("do_mem_abort");
     if (do_mem_abort_addr) hook_unwrap((void *)do_mem_abort_addr, before_do_mem_abort, 0);
+    hmkpm_info("Ghost Channel KPM Unloaded.\n");
     return 0;
 }
 
