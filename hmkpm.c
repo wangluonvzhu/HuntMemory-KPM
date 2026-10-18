@@ -20,21 +20,16 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/printk.h>
-#include <linux/string.h>   // 修复: 解决 memcpy 隐式声明
-#include <linux/rwsem.h>    // 修复: 解决 rw_semaphore 类型问题
 #include <asm/ptrace.h>
 #include <asm-generic/rwonce.h>
 
-// 修复: 补充缺失的宏定义
+// 补充缺失的宏定义
 #ifndef U64_MAX
 #define U64_MAX ((u64)~0ULL)
 #endif
 #ifndef min
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #endif
-
-// 修复: 显式前向声明，避免结构体冲突
-struct rw_semaphore;
 
 KPM_NAME("HMKPM");
 KPM_VERSION("1.0.0");
@@ -75,7 +70,7 @@ void kfunc_def(mmput)(struct mm_struct *mm);
 void kfunc_def(__rcu_read_lock)(void);
 void kfunc_def(__rcu_read_unlock)(void);
 
-// 修复: 将指针参数改为 void * 以兼容 KPM 宏的强类型匹配
+// 修复: 指针参数改为 void *，避免 KPM 环境找不到 struct rw_semaphore
 void kfunc_def(down_read)(void *sem);
 void kfunc_def(up_read)(void *sem);
 
@@ -86,6 +81,23 @@ static unsigned long hmkpm_lookup_symbol(const char *name)
 {
     if (!name || !kallsyms_lookup_name) return 0;
     return kallsyms_lookup_name(name);
+}
+
+// 修复: 自定义内存拷贝，避免引入 <string.h> 报错
+static inline void hmkpm_memcpy(void *dst, const void *src, size_t n)
+{
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    while (n >= 8) {
+        *(uint64_t *)d = *(const uint64_t *)s;
+        d += 8;
+        s += 8;
+        n -= 8;
+    }
+    while (n > 0) {
+        *d++ = *s++;
+        n--;
+    }
 }
 
 // 页表遍历相关全局变量
@@ -194,7 +206,7 @@ static int pgt_pgtable_init(void)
     if (pgt_page_level < 2 || pgt_page_level > 4) return -EINVAL;
     
     pgt_page_size = 1ULL << pgt_page_shift;
-    pgt_pgd_size = pgt_page_size; // 5.10+ always page size
+    pgt_pgd_size = pgt_page_size;
     pgt_pgd_align_mask = pgt_page_size - 1;
     pgt_page_offset = -(UL(1) << va1_bits);
 
@@ -233,7 +245,6 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
         }
 
         if (kf_down_read) {
-            // 修复: 强制转换为 void * 规避类型检查
             kfunc(down_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
         }
 
@@ -246,9 +257,9 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 
         void *tkva = (void *)pgt_phys_to_virt(tkpa);
         if (is_write) {
-            memcpy(tkva, bounce, chunk);
+            hmkpm_memcpy(tkva, bounce, chunk);
         } else {
-            memcpy(bounce, tkva, chunk);
+            hmkpm_memcpy(bounce, tkva, chunk);
         }
 
         if (kf_up_read) kfunc(up_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
@@ -294,7 +305,6 @@ static void before_do_mem_abort(hook_fargs3_t *args, void *udata)
     unsigned long far = (unsigned long)args->arg0;
     struct pt_regs *regs = (struct pt_regs *)args->arg2;
 
-    // 快速过滤：如果不是我们的特征地址，或者是模块被关闭，直接返回
     if (likely((far & HMKPM_GHOST_MASK) != HMKPM_GHOST_PREFIX)) return;
     if (!READ_ONCE(hook_active)) return;
 
@@ -302,16 +312,14 @@ static void before_do_mem_abort(hook_fargs3_t *args, void *udata)
     void __user *req_ptr = (void __user *)regs->regs[1];
     void __user *data_ptr = (void __user *)regs->regs[2];
 
-    // 伪造成功，跳过内核原有的 SIGSEGV 处理
     args->skip_origin = 1;
     args->ret = 0;
-    regs->regs[0] = 0; // 默认返回值
+    regs->regs[0] = 0;
 
     if (magic == HMKPM_MAGIC_READ || magic == HMKPM_MAGIC_WRITE) {
         regs->regs[0] = (uint64_t)hmkpm_do_rw(req_ptr, data_ptr, magic);
     }
 
-    // 强制 PC 跳过触发异常的指令（ARM64 固定 4 字节指令）
     regs->pc += 4;
 }
 
@@ -328,7 +336,6 @@ static long module_init_handler(const char *args, const char *event, void *__use
     kf___rcu_read_lock = (typeof(kf___rcu_read_lock))hmkpm_lookup_symbol("__rcu_read_lock");
     kf___rcu_read_unlock = (typeof(kf___rcu_read_unlock))hmkpm_lookup_symbol("__rcu_read_unlock");
     
-    // 修复后的 down_read/up_read 类型强转
     kf_down_read = (typeof(kf_down_read))hmkpm_lookup_symbol("down_read");
     kf_up_read = (typeof(kf_up_read))hmkpm_lookup_symbol("up_read");
 
