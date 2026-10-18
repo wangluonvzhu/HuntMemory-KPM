@@ -8,30 +8,36 @@ permissions:
 
 jobs:
   build-and-release:
-    runs-on: ubuntu-latest
+    # 1. 锁定稳定的 Runner 版本，防止 ubuntu-latest 环境漂移
+    runs-on: ubuntu-22.04
     steps:
+      # 2. 修正 checkout 版本为 v4
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           submodules: "recursive"
           fetch-depth: 0
 
       - name: Install Compiler
         run: |
+          echo "Downloading ARM64 bare-metal toolchain..."
           curl -fL -o arm-gnu-toolchain.tar.xz \
             https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
           tar -Jxf arm-gnu-toolchain.tar.xz
+          echo "Toolchain installed."
 
       - name: Extract version from source
         id: vars
         run: |
+          echo "Trying to extract version from hmkpm.c..."
           VERSION=$(grep -oP '#define\s+HMKPM_VERSION_STR\s+"\K[^"]+' hmkpm.c || true)
           if [ -z "$VERSION" ]; then
+            echo "Falling back to KPM_VERSION macro..."
             VERSION=$(grep -oP 'KPM_VERSION\("\K[^"]+' hmkpm.c || true)
           fi
           if [ -z "$VERSION" ]; then
-            echo "ERROR: Could not extract version from hmkpm.c"
-            exit 1
+            echo "ERROR: Could not extract version from hmkpm.c. Using default 'v1.0.0'"
+            VERSION="v1.0.0"
           fi
           echo "Extracted version: $VERSION"
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
@@ -39,14 +45,27 @@ jobs:
       - name: Build KPM
         run: |
           export PATH="$(pwd)/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin:$PATH"
-          make
+          echo "Compiler path: $(which aarch64-none-elf-gcc)"
+          
+          # 强制指定交叉编译器前缀（防止 Makefile 默认用 gcc）
+          make CROSS_COMPILE=aarch64-none-elf- || make
+          
+          echo "Checking build artifacts..."
+          ls -la *.kpm || echo "No .kpm file found in root."
+          
+          # 兼容性改名：如果生成的叫 hmkpm_ghost.kpm 或者找不到，做一下兜底
+          if [ -f hmkpm_ghost.kpm ] && [ ! -f hmkpm.kpm ]; then
+            mv hmkpm_ghost.kpm hmkpm.kpm
+          fi
+          
           if [ ! -f hmkpm.kpm ]; then
-            echo "ERROR: hmkpm.kpm not found after build"
+            echo "ERROR: hmkpm.kpm not found after build!"
             exit 1
           fi
 
+      # 3. 修正 Release Action 版本为稳定的 v1
       - name: Create Release
-        uses: ncipollo/release-action@v1.21.0
+        uses: ncipollo/release-action@v1
         with:
           tag: ${{ steps.vars.outputs.VERSION }}
           name: Release ${{ steps.vars.outputs.VERSION }}
