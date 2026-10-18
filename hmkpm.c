@@ -3,7 +3,7 @@
  * Copyright (c) 2026 Yervant7
  *
  * KernelPatch Module (KPM) - [HMKPM]
- * 2.9.1 - Socket 通信 + WC 读取（5.10 内核）
+ * 2.9.2 - Socket 通信 + WC 读取（修复初始化卡死）
  */
 
 #include <asm/current.h>
@@ -26,28 +26,21 @@
 #include <uapi/asm-generic/unistd.h>
 #include <asm-generic/rwonce.h>
 
-/* ============================================================
- * 通道选择：1 = Socket（推荐），0 = getresuid Hook（旧方案）
- * ============================================================ */
 #ifndef HMKPM_USE_SOCKET_CHANNEL
 #define HMKPM_USE_SOCKET_CHANNEL 1
 #endif
 
-/* ============================================================
- * 隐蔽编译开关：1 = 静默日志，0 = 打印日志
- * 首次测试用 0 验证，验证通过后改回 1
- * ============================================================ */
 #ifndef HMKPM_STEALTH_BUILD
 #define HMKPM_STEALTH_BUILD 0
 #endif
 
 #define HMKPM_VERSION_MAJOR	2
 #define HMKPM_VERSION_MINOR	9
-#define HMKPM_VERSION_PATCH	1
+#define HMKPM_VERSION_PATCH	2
 #define HMKPM_VERSION_CODE	(((uint32_t)HMKPM_VERSION_MAJOR << 16) | \
 				 ((uint32_t)HMKPM_VERSION_MINOR << 8) | \
 				 ((uint32_t)HMKPM_VERSION_PATCH))
-#define HMKPM_VERSION_STR	"2.9.1"
+#define HMKPM_VERSION_STR	"2.9.2"
 
 KPM_NAME("HMKPM");
 KPM_VERSION(HMKPM_VERSION_STR);
@@ -81,7 +74,6 @@ struct rw_semaphore;
 #endif
 #define hmkpm_error(fmt, ...)       logke(HMKPM_TAG fmt, ##__VA_ARGS__)
 
-/* MEMREMAP_WC 定义 */
 #ifndef MEMREMAP_WC
 #define MEMREMAP_WC (1UL << 2)
 #endif
@@ -150,7 +142,6 @@ void kfunc_def(__rcu_read_unlock)(void);
 void kfunc_def(down_read)(struct rw_semaphore *sem);
 void kfunc_def(up_read)(struct rw_semaphore *sem);
 
-/* Socket 通道 + WC 映射所需符号 */
 void *kfunc_def(kzalloc)(size_t size, unsigned int flags);
 void kfunc_def(kfree)(const void *obj);
 int kfunc_def(sock_register)(void *ops);
@@ -162,9 +153,6 @@ u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
 void *kvar_def(init_net);
 
-/* ============================================================
- * Socket 通信层常量与偏移（5.10 内核）
- * ============================================================ */
 #define HMKPM_IOCTL_BASE        0xC0484800U
 #define HMKPM_IOCTL_PROBE       (HMKPM_IOCTL_BASE + 1)
 #define HMKPM_IOCTL_READ        (HMKPM_IOCTL_BASE + 2)
@@ -216,10 +204,6 @@ static void before_fsnotify(hook_fargs7_t *args, void *udata)
         args->ret = 0;
     }
 }
-
-/* ========================================================================
- * 协议数据结构
- * ======================================================================== */
 
 #define HMKPM_MAGIC			0x484D4B504DULL
 #define HMKPM_MAGIC_READ		(HMKPM_MAGIC + 1)
@@ -355,10 +339,6 @@ struct hmkpm_req {
 #define HMKPM_BATCH_ENTRY_SIZE		((uint64_t)sizeof(struct hmkpm_batch_entry))
 #define HMKPM_REQ_SIZE			((uint64_t)sizeof(struct hmkpm_req))
 
-/* ========================================================================
- * 底层工具
- * ======================================================================== */
-
 static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, size_t size)
 {
 	kfunc_call(copy_from_kernel_nofault, dst, src, size);
@@ -384,24 +364,23 @@ static inline uint64_t pgt_virt_to_phys(uint64_t addr) { return addr - pgt_linea
 static bool sw_pan_enabled = false;
 static uint64_t reserved_ttbr0_val = 0;
 
+/*
+ * GKI 5.10 使用硬件 PAN（CONFIG_ARM64_PAN），SW PAN 在运行时默认不启用。
+ * reserved_ttbr0 符号存在只说明编译时包含了 SW_PAN 相关代码，
+ * 不代表运行时内核真正切换到软件 PAN 模式。
+ *
+ * 之前的代码只要检测到 reserved_ttbr0 符号存在就设置 sw_pan_enabled = true，
+ * 导致 hmkpm_uaccess_enable() 去切换 TTBR0，而 mm_struct->pgd 的偏移
+ * 在不同内核版本下可能不同，一旦偏移错误，写入非法物理地址，MMU 崩溃，系统卡死。
+ *
+ * 修复：强制禁用 SW_PAN。硬件 PAN 由内核的 __arch_copy_to_user/__arch_copy_from_user
+ * 自动处理，不需要我们手动干预 TTBR0。
+ */
 static void hmkpm_sw_pan_init(void)
 {
-	if (kp_kconfig_enabled("CONFIG_ARM64_SW_TTBR0_PAN"))
-		sw_pan_enabled = true;
-	unsigned long sym_reserved = hmkpm_lookup_symbol("reserved_ttbr0");
-	if (sym_reserved) {
-		uint64_t pa = 0;
-		if (hmkpm_copy_from_kernel_nofault(&pa, (const void *)sym_reserved, sizeof(pa)) == 0 && pa) {
-			reserved_ttbr0_val = pa;
-			sw_pan_enabled = true;
-		}
-	}
-	if (!sw_pan_enabled && sym_reserved) {
-		uint64_t mmfr1;
-		asm volatile("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
-		if (((mmfr1 >> 20) & 0xFULL) == 0) sw_pan_enabled = true;
-	}
-	if (sw_pan_enabled) hmkpm_info("SW PAN detected\n");
+	sw_pan_enabled = false;
+	reserved_ttbr0_val = 0;
+	hmkpm_info("SW PAN forced disabled (GKI uses HW PAN)\n");
 }
 
 static inline uint64_t hmkpm_uaccess_enable(void)
@@ -723,7 +702,6 @@ static inline void hmkpm_fast_copy(void *dst, const void *src, size_t n)
 	while (n > 0) { *d++ = *s++; n--; }
 }
 
-/* WC 读取映射辅助（无回退） */
 static inline void *hmkpm_wc_map_page(uint64_t page_phys)
 {
 	if (!kf_memremap) return NULL;
@@ -761,7 +739,6 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len,
 			void *tkva = (void *)pgt_phys_to_virt(tkpa);
 			hmkpm_fast_copy(tkva, bounce, chunk);
 		} else {
-			/* 读路径：WC 映射，无回退 */
 			uint64_t page_phys = tkpa & ~(pgt_page_size - 1);
 			size_t   page_off2 = (size_t)(tkpa & (pgt_page_size - 1));
 			void *mapped = hmkpm_wc_map_page(page_phys);
@@ -773,7 +750,6 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len,
 				if (total > 0) break;
 				return -EFAULT;
 			} else {
-				/* memremap 符号缺失：退化为线性映射 */
 				void *tkva = (void *)pgt_phys_to_virt(tkpa);
 				hmkpm_fast_copy(bounce, tkva, chunk);
 			}
@@ -808,10 +784,6 @@ static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len,
 	kfunc(mmput)(mm);
 	return ret;
 }
-
-/* ========================================================================
- * 无状态 handler
- * ======================================================================== */
 
 static int hmkpm_do_probe(void __user *arg)
 {
@@ -965,7 +937,6 @@ out_mm:
 	return rc;
 }
 
-/* 类型大小辅助 */
 static inline bool f32_is_nan(uint32_t u) { return ((u & 0x7F800000U) == 0x7F800000U) && (u & 0x007FFFFFU); }
 static inline bool f64_is_nan(uint64_t u) { return ((u & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL) && (u & 0x000FFFFFFFFFFFFFULL); }
 static inline int32_t f32_to_orderable(uint32_t u) {
@@ -1230,10 +1201,6 @@ out:
 	return rc;
 }
 
-/* ========================================================================
- * Socket 通信层
- * ======================================================================== */
-
 #if HMKPM_USE_SOCKET_CHANNEL
 
 struct hmkpm_proto_ops_layout {
@@ -1275,45 +1242,31 @@ static int hmkpm_sock_release(void *sock);
 static int hmkpm_sock_ioctl(void *sock, unsigned int cmd, unsigned long arg);
 
 static struct hmkpm_proto_ops_layout hmkpm_proto_ops_inst = {
-	.family = 0,
-	.owner = NULL,
+	.family = 0, .owner = NULL,
 	.release = hmkpm_sock_release,
 	.bind = hmkpm_sock_noop3,
 	.connect = hmkpm_sock_noop4,
 	.socketpair = (void *)hmkpm_sock_noop3,
 	.accept = hmkpm_sock_noop4,
 	.getname = hmkpm_sock_noop3,
-	.poll = NULL,
-	.ioctl = hmkpm_sock_ioctl,
-	.compat_ioctl = NULL,
-	.gettstamp = NULL,
-	.listen = hmkpm_sock_noop3,
-	.shutdown = hmkpm_sock_noop3,
-	.setsockopt = NULL,
-	.getsockopt = NULL,
-	.show_fdinfo = NULL,
-	.sendmsg = NULL,
-	.recvmsg = NULL,
+	.poll = NULL, .ioctl = hmkpm_sock_ioctl,
+	.compat_ioctl = NULL, .gettstamp = NULL,
+	.listen = hmkpm_sock_noop3, .shutdown = hmkpm_sock_noop3,
+	.setsockopt = NULL, .getsockopt = NULL, .show_fdinfo = NULL,
+	.sendmsg = NULL, .recvmsg = NULL,
 	.mmap = hmkpm_sock_noop3,
-	.sendpage = NULL,
-	.splice_read = NULL,
-	.set_peek_off = NULL,
+	.sendpage = NULL, .splice_read = NULL, .set_peek_off = NULL,
 };
 
-static struct hmkpm_net_proto_family hmkpm_family_inst = {
-	.family = 0,
-	.create = NULL,
-	.owner = NULL,
-};
+static struct hmkpm_net_proto_family hmkpm_family_inst = { .family = 0, .create = NULL, .owner = NULL };
 
 static int hmkpm_sock_release(void *sock)
 {
-	if (!sock) return 0;
-	void *sk = *(void **)((char *)sock + HMKPM_SOCKET_SK_OFFSET);
-	if (sk) {
-		kfunc(kfree)(sk);
-		*(void **)((char *)sock + HMKPM_SOCKET_SK_OFFSET) = NULL;
-	}
+	/*
+	 * create 时未分配 sk，release 无需释放任何资源。
+	 * 不读 sock->sk，避免万一被外部改写成垃圾值。
+	 */
+	(void)sock;
 	return 0;
 }
 
@@ -1338,15 +1291,25 @@ static int hmkpm_sock_create(void *net, void *sock, int protocol, int kern)
 {
 	(void)net; (void)protocol; (void)kern;
 	if (!sock) return -EINVAL;
+
 	short stype = *(short *)((char *)sock + HMKPM_SOCKET_TYPE_OFFSET);
 	if (stype != HMKPM_SOCK_RAW) return -ENOKEY;
-	void *fake_sk = kfunc(kzalloc)(HMKPM_FAKE_SK_SIZE, 0xCC0);
-	if (!fake_sk) return -ENOMEM;
-	if (kv_init_net)
-		*(void **)((char *)fake_sk + HMKPM_SKC_NET_OFFSET) = kv_init_net;
-	*(void **)((char *)sock + HMKPM_SOCKET_SK_OFFSET) = fake_sk;
+
+	/*
+	 * 关键：此函数在 RCU 读锁内被 __sock_create() 调用。
+	 * 绝不能调用 kzalloc(GFP_KERNEL)（会 sleep），否则触发
+	 * "BUG: scheduling while atomic"，系统卡死。
+	 *
+	 * sock->sk 必须显式置 NULL：
+	 *   1. SELinux 的 security_socket_post_create() 会检查 `if (!sock->sk) return 0;`，
+	 *      NULL 是合法的。
+	 *   2. sock_alloc() 分配 inode 时 sock->sk 可能是垃圾值，
+	 *      如果不显式清 NULL，后续路径可能误访问它导致崩溃。
+	 */
+	*(void **)((char *)sock + HMKPM_SOCKET_SK_OFFSET) = NULL;
 	*(void **)((char *)sock + HMKPM_SOCKET_OPS_OFFSET) = (void *)&hmkpm_proto_ops_inst;
-	*(int *)((char *)sock) = 1;
+	*(int *)((char *)sock) = 1;  /* SS_UNCONNECTED */
+
 	return 0;
 }
 
@@ -1354,10 +1317,9 @@ static int hmkpm_proto_family_id = -1;
 
 static int hmkpm_register_family(void)
 {
-	int f;
 	hmkpm_family_inst.create = hmkpm_sock_create;
 	hmkpm_family_inst.owner = NULL;
-	for (f = HMKPM_FAMILY_START; f < HMKPM_FAMILY_END; f++) {
+	for (int f = HMKPM_FAMILY_START; f < HMKPM_FAMILY_END; f++) {
 		hmkpm_family_inst.family = f;
 		if (kfunc(sock_register)(&hmkpm_family_inst) == 0) {
 			hmkpm_proto_ops_inst.family = f;
@@ -1368,11 +1330,7 @@ static int hmkpm_register_family(void)
 	return -ENOENT;
 }
 
-#endif /* HMKPM_USE_SOCKET_CHANNEL */
-
-/* ========================================================================
- * 旧通道（getresuid hook）
- * ======================================================================== */
+#endif
 
 #if !HMKPM_USE_SOCKET_CHANNEL
 static void hmkpm_handle(hook_fargs3_t *args, void *udata)
@@ -1383,11 +1341,7 @@ static void hmkpm_handle(hook_fargs3_t *args, void *udata)
 	if (!READ_ONCE(hook_active)) return;
 	if (current_uid() != 0) return;
 	args->skip_origin = 1;
-	if (magic == HMKPM_MAGIC) {
-		user_ptr = (void __user *)syscall_argn(args, 1);
-		args->ret = (uint64_t)(long)hmkpm_do_probe(user_ptr);
-		return;
-	}
+	if (magic == HMKPM_MAGIC) { args->ret = (uint64_t)(long)hmkpm_do_probe((void __user *)syscall_argn(args, 1)); return; }
 	user_ptr = (void __user *)syscall_argn(args, 1);
 	if (magic == HMKPM_MAGIC_READ) { args->ret = (uint64_t)(long)hmkpm_do_single(user_ptr, false); return; }
 	if (magic == HMKPM_MAGIC_WRITE) { args->ret = (uint64_t)(long)hmkpm_do_single(user_ptr, true); return; }
@@ -1399,10 +1353,6 @@ static void hmkpm_handle(hook_fargs3_t *args, void *udata)
 }
 #endif
 
-/* ========================================================================
- * mmap_sem 偏移
- * ======================================================================== */
-
 static inline int get_mm_mmap_lock_offset(void)
 {
 	if (kver >= VERSION(6, 12, 0)) return 136;
@@ -1412,10 +1362,6 @@ static inline int get_mm_mmap_lock_offset(void)
 	else if (kver >= VERSION(5, 10, 0)) return 112;
 	else return -1;
 }
-
-/* ========================================================================
- * 初始化 / 清理
- * ======================================================================== */
 
 static long module_init_handler(const char *args, const char *event, void *__user reserved)
 {
@@ -1473,7 +1419,6 @@ static long module_init_handler(const char *args, const char *event, void *__use
 	kf_copy_to_kernel_nofault = (typeof(kf_copy_to_kernel_nofault))hmkpm_lookup_symbol("copy_to_kernel_nofault");
 	if (!kf_copy_to_kernel_nofault) hkfunc_match(probe_kernel_write);
 
-	/* WC 读取映射 */
 	kf_memremap = (typeof(kf_memremap))hmkpm_lookup_symbol("memremap");
 	kf_memunmap = (typeof(kf_memunmap))hmkpm_lookup_symbol("memunmap");
 	if (kf_memremap && kf_memunmap) {
@@ -1510,8 +1455,8 @@ static long module_init_handler(const char *args, const char *event, void *__use
 	kf_sock_unregister = (typeof(kf_sock_unregister))hmkpm_lookup_symbol("sock_unregister");
 	kv_init_net = (void *)hmkpm_lookup_symbol("init_net");
 
-	if (!kf_kzalloc || !kf_kfree || !kf_sock_register || !kf_sock_unregister) {
-		hmkpm_error("socket symbols missing\n");
+	if (!kf_sock_register || !kf_sock_unregister) {
+		hmkpm_error("sock_register/sock_unregister missing\n");
 		return -ENOENT;
 	}
 
@@ -1553,7 +1498,6 @@ static long module_cleanup_handler(void *__user reserved)
 	return 0;
 }
 
-/* KPM_CTL0 */
 static inline int kpm_isspace(char c) { return (c == ' ' || c == '\t' || c == '\n' || c == '\r'); }
 static const char *kpm_skip_spaces(const char *s) { if (!s) return ""; while (*s && kpm_isspace(*s)) s++; return s; }
 static bool kpm_streq(const char *s1, const char *s2) {
