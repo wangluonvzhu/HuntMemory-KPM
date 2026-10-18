@@ -1,9 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * KernelPatch Module (KPM) - Ghost Channel Edition
- * 融合 HuntMemory-KPM 的页表遍历 + android-wuwa 的 do_mem_abort 隐蔽通信
- */
-
 #include <asm/current.h>
 #include <common.h>
 #include <compiler.h>
@@ -23,7 +18,6 @@
 #include <asm/ptrace.h>
 #include <asm-generic/rwonce.h>
 
-// 补充缺失的宏定义
 #ifndef U64_MAX
 #define U64_MAX ((u64)~0ULL)
 #endif
@@ -32,10 +26,10 @@
 #endif
 
 KPM_NAME("HMKPM");
-KPM_VERSION("1.0.0");
+KPM_VERSION("1.1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Fusion");
-KPM_DESCRIPTION("Ghost Channel Memory R/W");
+KPM_DESCRIPTION("Ghost Channel Memory R/W & Module Base");
 
 #define HMKPM_TAG "[HMKPM] "
 #define hmkpm_info(fmt, ...)        logki(HMKPM_TAG fmt, ##__VA_ARGS__)
@@ -45,8 +39,9 @@ KPM_DESCRIPTION("Ghost Channel Memory R/W");
 #define HMKPM_GHOST_PREFIX 0xDEAD000000000000ULL
 #define HMKPM_GHOST_MASK   0xFFFF000000000000ULL
 
-#define HMKPM_MAGIC_READ   0x101
-#define HMKPM_MAGIC_WRITE  0x102
+#define HMKPM_MAGIC_READ        0x101
+#define HMKPM_MAGIC_WRITE       0x102
+#define HMKPM_MAGIC_MODULE_BASE 0x103  // 新增：查模块基址
 
 struct hmkpm_req {
     int32_t pid;
@@ -54,10 +49,15 @@ struct hmkpm_req {
     uint64_t addr;
     uint64_t size;
 };
+
+struct hmkpm_module_req {
+    int32_t pid;
+    char module_name[256];
+};
 // ----------------------------------------------------
 
 static bool hook_active = true;
-static int mmap_lock_sem_offset = 112; // Kernel 5.10 标准 GKI 偏移量固定为 112
+static int mmap_lock_sem_offset = 112; // Android 5.10 固定偏移
 
 // 需要动态解析的内核符号
 void *kfunc_def(memset)(void *s, int c, size_t count);
@@ -69,10 +69,10 @@ struct mm_struct *kfunc_def(get_task_mm)(struct task_struct *task);
 void kfunc_def(mmput)(struct mm_struct *mm);
 void kfunc_def(__rcu_read_lock)(void);
 void kfunc_def(__rcu_read_unlock)(void);
-
-// 修复: 指针参数改为 void *，避免 KPM 环境找不到 struct rw_semaphore
 void kfunc_def(down_read)(void *sem);
 void kfunc_def(up_read)(void *sem);
+void *kfunc_def(kmalloc)(size_t size, int flags);
+void kfunc_def(kfree)(const void *objp);
 
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
@@ -83,35 +83,19 @@ static unsigned long hmkpm_lookup_symbol(const char *name)
     return kallsyms_lookup_name(name);
 }
 
-// 修复: 自定义内存拷贝，避免引入 <string.h> 报错
+// 自定义内存拷贝
 static inline void hmkpm_memcpy(void *dst, const void *src, size_t n)
 {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
-    while (n >= 8) {
-        *(uint64_t *)d = *(const uint64_t *)s;
-        d += 8;
-        s += 8;
-        n -= 8;
-    }
-    while (n > 0) {
-        *d++ = *s++;
-        n--;
-    }
+    while (n >= 8) { *(uint64_t *)d = *(const uint64_t *)s; d += 8; s += 8; n -= 8; }
+    while (n > 0) { *d++ = *s++; n--; }
 }
 
-// 页表遍历相关全局变量
-static uint64_t pgt_va_bits;
-static uint64_t pgt_phys_offset;
-static uint64_t pgt_page_offset;
-static uint64_t pgt_linear_voffset;
-static uint64_t pgt_page_shift;
-static uint64_t pgt_page_size;
-static uint64_t pgt_pgd_align_mask;
-static uint64_t pgt_pgd_size;
-static uint64_t pgt_page_level;
-static uint64_t pgt_user_limit;
-static uint64_t pgt_high_memory;
+// 页表遍历相关
+static uint64_t pgt_va_bits, pgt_phys_offset, pgt_page_offset, pgt_linear_voffset;
+static uint64_t pgt_page_shift, pgt_page_size, pgt_pgd_align_mask, pgt_pgd_size;
+static uint64_t pgt_page_level, pgt_user_limit, pgt_high_memory;
 
 static inline uint64_t pgt_phys_to_virt(uint64_t phys) { return phys + pgt_linear_voffset; }
 static inline uint64_t pgt_virt_to_phys(uint64_t addr) { return addr - pgt_linear_voffset; }
@@ -124,13 +108,11 @@ static inline int validate_virt_range(uint64_t va, uint64_t size)
     if (unlikely((va + size - 1) >= pgt_high_memory)) return -EFAULT;
     return 0;
 }
-
 static inline int validate_phys_range(uint64_t phys, uint64_t size)
 {
     if (unlikely(size == 0) || (phys >> 48) != 0) return -EFAULT;
     return validate_virt_range(pgt_phys_to_virt(phys), size);
 }
-
 static inline uint64_t pgt_desc_to_phys(uint64_t desc)
 {
     uint64_t addr_mask = (((1ULL << (48 - pgt_page_shift)) - 1) << pgt_page_shift);
@@ -170,7 +152,7 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write)
             return validate_phys_range(base, pgt_page_size) ? 0 : (base | (va & (pgt_page_size - 1)));
         }
 
-        if (type == 1ULL) { // Block
+        if (type == 1ULL) {
             if (pgt_page_shift == 14 ? (lv != 2) : (lv != 1 && lv != 2)) return 0;
             if (is_write && (desc & (1ULL << 7)) && !(desc & (1ULL << 51))) return 0;
             uint64_t block_bits = (uint64_t)(3 - lv) * pxd_bits + pgt_page_shift;
@@ -191,23 +173,18 @@ static int pgt_pgtable_init(void)
 {
     uint64_t tcr_el1, t1sz, va1_bits, t0sz, va0_bits, tg0;
     asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
-    t1sz = (tcr_el1 >> 16) & 0x3F;
-    va1_bits = 64 - t1sz;
-    t0sz = tcr_el1 & 0x3F;
-    va0_bits = 64 - t0sz;
-    tg0 = (tcr_el1 >> 14) & 0x3ULL;
+    t1sz = (tcr_el1 >> 16) & 0x3F; va1_bits = 64 - t1sz;
+    t0sz = tcr_el1 & 0x3F; va0_bits = 64 - t0sz; tg0 = (tcr_el1 >> 14) & 0x3ULL;
 
     if (va0_bits > 48 || va0_bits < 36) return -EINVAL;
-    pgt_va_bits = va0_bits;
-    pgt_user_limit = (1ULL << va0_bits) - 1;
+    pgt_va_bits = va0_bits; pgt_user_limit = (1ULL << va0_bits) - 1;
     pgt_page_shift = (tg0 == 0) ? 12 : ((tg0 == 2) ? 14 : 0);
     if (!pgt_page_shift) return -EINVAL;
     pgt_page_level = (va0_bits - 4) / (pgt_page_shift - 3);
     if (pgt_page_level < 2 || pgt_page_level > 4) return -EINVAL;
     
     pgt_page_size = 1ULL << pgt_page_shift;
-    pgt_pgd_size = pgt_page_size;
-    pgt_pgd_align_mask = pgt_page_size - 1;
+    pgt_pgd_size = pgt_page_size; pgt_pgd_align_mask = pgt_page_size - 1;
     pgt_page_offset = -(UL(1) << va1_bits);
 
     if (!kallsyms_lookup_name) return -EFAULT;
@@ -221,32 +198,23 @@ static int pgt_pgtable_init(void)
     return 0;
 }
 
-// ----------------- 读写核心逻辑 -----------------
-
+// ----------------- 核心读写功能 -----------------
 static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, void __user *local_buf, bool is_write)
 {
     ssize_t total = 0;
     uint64_t pgd = 0;
-    uint8_t bounce[512]; // 栈上缓冲
+    uint8_t bounce[512];
 
     if (!mm) return -ESRCH;
-    
-    if (kfunc(copy_from_kernel_nofault)(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(pgd)) != 0 || !pgd) {
-        return -EFAULT;
-    }
+    if (kfunc(copy_from_kernel_nofault)(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(pgd)) != 0 || !pgd) return -EFAULT;
 
     while (len > 0) {
         unsigned long page_off = remote_va & (pgt_page_size - 1);
         size_t chunk = min(len, (size_t)(pgt_page_size - page_off));
         chunk = min(chunk, (size_t)sizeof(bounce));
 
-        if (is_write) {
-            if (kfunc(__arch_copy_from_user)(bounce, local_buf, chunk) != 0) break;
-        }
-
-        if (kf_down_read) {
-            kfunc(down_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
-        }
+        if (is_write && kfunc(__arch_copy_from_user)(bounce, local_buf, chunk) != 0) break;
+        if (kf_down_read) kfunc(down_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
 
         uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, remote_va, is_write);
         if (!tkpa) {
@@ -256,22 +224,14 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
         }
 
         void *tkva = (void *)pgt_phys_to_virt(tkpa);
-        if (is_write) {
-            hmkpm_memcpy(tkva, bounce, chunk);
-        } else {
-            hmkpm_memcpy(bounce, tkva, chunk);
-        }
+        if (is_write) hmkpm_memcpy(tkva, bounce, chunk);
+        else hmkpm_memcpy(bounce, tkva, chunk);
 
         if (kf_up_read) kfunc(up_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
+        if (!is_write && kfunc(__arch_copy_to_user)(local_buf, bounce, chunk) != 0) break;
 
-        if (!is_write) {
-            if (kfunc(__arch_copy_to_user)(local_buf, bounce, chunk) != 0) break;
-        }
-
-        total += chunk;
-        local_buf = (void __user *)((uintptr_t)local_buf + chunk);
-        remote_va += chunk;
-        len -= chunk;
+        total += chunk; local_buf = (void __user *)((uintptr_t)local_buf + chunk);
+        remote_va += chunk; len -= chunk;
     }
     return total;
 }
@@ -279,8 +239,7 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 static long hmkpm_do_rw(void __user *req_ptr, void __user *data_ptr, uint64_t magic)
 {
     struct hmkpm_req req;
-    if (kfunc(__arch_copy_from_user)(&req, req_ptr, sizeof(req)) != 0) return -EFAULT;
-    if (req.size == 0) return 0;
+    if (kfunc(__arch_copy_from_user)(&req, req_ptr, sizeof(req)) != 0 || req.size == 0) return -EFAULT;
 
     bool is_write = (magic == HMKPM_MAGIC_WRITE);
     struct task_struct *task = NULL;
@@ -298,8 +257,52 @@ static long hmkpm_do_rw(void __user *req_ptr, void __user *data_ptr, uint64_t ma
     return (ret == (long)req.size) ? 0 : -EFAULT;
 }
 
-// ----------------- 缺页异常拦截通道 -----------------
+// ----------------- 模块基址查询功能 (遍历 VMA) -----------------
+static long hmkpm_get_module_base(void __user *req_ptr, void __user *out_base_ptr)
+{
+    struct hmkpm_module_req kreq;
+    struct task_struct *task = NULL;
+    struct mm_struct *mm = NULL;
+    unsigned long found_base = 0;
 
+    if (kfunc(__arch_copy_from_user)(&kreq, req_ptr, sizeof(kreq)) != 0) return -EFAULT;
+    if (kreq.pid <= 0 || kreq.module_name[0] == '\0') return -EINVAL;
+
+    kfunc(__rcu_read_lock)();
+    task = kfunc(find_task_by_vpid)(kreq.pid);
+    if (task) mm = kfunc(get_task_mm)(task);
+    kfunc(__rcu_read_unlock)();
+    if (!mm) return -ESRCH;
+
+    // mm->mmap 偏移量通常是 0，如果不对可以加上 mm_struct_offset.mmap_offset
+    struct vm_area_struct *vma_iter = *(struct vm_area_struct **)((uintptr_t)mm + 0); 
+
+    if (kf_down_read) kfunc(down_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
+
+    while (vma_iter) {
+        if (vma_iter->vm_file) {
+            // 从 file 结构体获取 dentry
+            struct dentry *dentry = *(struct dentry **)((uintptr_t)vma_iter->vm_file + 0x18); // f_path.dentry 偏移
+            if (dentry && dentry->d_name.name) {
+                // 简单匹配字符串
+                if (strstr(dentry->d_name.name, kreq.module_name) != NULL) {
+                    found_base = vma_iter->vm_start;
+                    break;
+                }
+            }
+        }
+        // vm_next 偏移通常是 8
+        vma_iter = *(struct vm_area_struct **)((uintptr_t)vma_iter + 8);
+    }
+
+    if (kf_up_read) kfunc(up_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
+    kfunc(mmput)(mm);
+
+    if (kfunc(__arch_copy_to_user)(out_base_ptr, &found_base, sizeof(found_base)) != 0) return -EFAULT;
+    return 0;
+}
+
+// ----------------- 缺页异常拦截通道 -----------------
 static void before_do_mem_abort(hook_fargs3_t *args, void *udata)
 {
     unsigned long far = (unsigned long)args->arg0;
@@ -318,6 +321,8 @@ static void before_do_mem_abort(hook_fargs3_t *args, void *udata)
 
     if (magic == HMKPM_MAGIC_READ || magic == HMKPM_MAGIC_WRITE) {
         regs->regs[0] = (uint64_t)hmkpm_do_rw(req_ptr, data_ptr, magic);
+    } else if (magic == HMKPM_MAGIC_MODULE_BASE) {
+        regs->regs[0] = (uint64_t)hmkpm_get_module_base(req_ptr, data_ptr);
     }
 
     regs->pc += 4;
@@ -335,28 +340,20 @@ static long module_init_handler(const char *args, const char *event, void *__use
     kf_mmput = (typeof(kf_mmput))hmkpm_lookup_symbol("mmput");
     kf___rcu_read_lock = (typeof(kf___rcu_read_lock))hmkpm_lookup_symbol("__rcu_read_lock");
     kf___rcu_read_unlock = (typeof(kf___rcu_read_unlock))hmkpm_lookup_symbol("__rcu_read_unlock");
-    
     kf_down_read = (typeof(kf_down_read))hmkpm_lookup_symbol("down_read");
     kf_up_read = (typeof(kf_up_read))hmkpm_lookup_symbol("up_read");
+    kf_kmalloc = (typeof(kf_kmalloc))hmkpm_lookup_symbol("__kmalloc");
+    kf_kfree = (typeof(kf_kfree))hmkpm_lookup_symbol("kfree");
 
-    if (!kf___arch_copy_to_user || !kf___arch_copy_from_user || !kf_find_task_by_vpid) {
-        hmkpm_error("Core symbols missing!\n");
-        return -ENOENT;
-    }
+    if (!kf___arch_copy_to_user || !kf___arch_copy_from_user || !kf_find_task_by_vpid) return -ENOENT;
 
     unsigned long do_mem_abort_addr = hmkpm_lookup_symbol("do_mem_abort");
-    if (!do_mem_abort_addr) {
-        hmkpm_error("Failed to find do_mem_abort!\n");
-        return -ENOENT;
-    }
+    if (!do_mem_abort_addr) return -ENOENT;
 
     hook_err_t err = hook_wrap3((void *)do_mem_abort_addr, before_do_mem_abort, 0, 0);
-    if (err) {
-        hmkpm_error("hook do_mem_abort failed: %d\n", err);
-        return -ENOENT;
-    }
+    if (err) return -ENOENT;
 
-    hmkpm_info("Ghost Channel KPM Loaded.\n");
+    hmkpm_info("Ghost Channel Full Edition Loaded.\n");
     return 0;
 }
 
@@ -364,7 +361,6 @@ static long module_cleanup_handler(void *__user reserved)
 {
     unsigned long do_mem_abort_addr = hmkpm_lookup_symbol("do_mem_abort");
     if (do_mem_abort_addr) hook_unwrap((void *)do_mem_abort_addr, before_do_mem_abort, 0);
-    hmkpm_info("Ghost Channel KPM Unloaded.\n");
     return 0;
 }
 
