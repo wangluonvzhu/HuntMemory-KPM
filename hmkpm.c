@@ -15,6 +15,7 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/printk.h>
+#include <linux/string.h>   // 修复: strstr 缺失
 #include <asm/ptrace.h>
 #include <asm-generic/rwonce.h>
 
@@ -41,7 +42,7 @@ KPM_DESCRIPTION("Ghost Channel Memory R/W & Module Base");
 
 #define HMKPM_MAGIC_READ        0x101
 #define HMKPM_MAGIC_WRITE       0x102
-#define HMKPM_MAGIC_MODULE_BASE 0x103  // 新增：查模块基址
+#define HMKPM_MAGIC_MODULE_BASE 0x103
 
 struct hmkpm_req {
     int32_t pid;
@@ -57,9 +58,8 @@ struct hmkpm_module_req {
 // ----------------------------------------------------
 
 static bool hook_active = true;
-static int mmap_lock_sem_offset = 112; // Android 5.10 固定偏移
+static int mmap_lock_sem_offset = 112;
 
-// 需要动态解析的内核符号
 void *kfunc_def(memset)(void *s, int c, size_t count);
 unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
 unsigned long kfunc_def(__arch_copy_from_user)(void *to, const void __user *from, unsigned long n);
@@ -71,8 +71,7 @@ void kfunc_def(__rcu_read_lock)(void);
 void kfunc_def(__rcu_read_unlock)(void);
 void kfunc_def(down_read)(void *sem);
 void kfunc_def(up_read)(void *sem);
-void *kfunc_def(kmalloc)(size_t size, int flags);
-void kfunc_def(kfree)(const void *objp);
+char *kfunc_def(strstr)(const char *s1, const char *s2); // 动态解析 strstr
 
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
@@ -83,7 +82,6 @@ static unsigned long hmkpm_lookup_symbol(const char *name)
     return kallsyms_lookup_name(name);
 }
 
-// 自定义内存拷贝
 static inline void hmkpm_memcpy(void *dst, const void *src, size_t n)
 {
     uint8_t *d = (uint8_t *)dst;
@@ -257,7 +255,7 @@ static long hmkpm_do_rw(void __user *req_ptr, void __user *data_ptr, uint64_t ma
     return (ret == (long)req.size) ? 0 : -EFAULT;
 }
 
-// ----------------- 模块基址查询功能 (遍历 VMA) -----------------
+// ----------------- 模块基址查询功能 (基于指针偏移) -----------------
 static long hmkpm_get_module_base(void __user *req_ptr, void __user *out_base_ptr)
 {
     struct hmkpm_module_req kreq;
@@ -274,25 +272,29 @@ static long hmkpm_get_module_base(void __user *req_ptr, void __user *out_base_pt
     kfunc(__rcu_read_unlock)();
     if (!mm) return -ESRCH;
 
-    // mm->mmap 偏移量通常是 0，如果不对可以加上 mm_struct_offset.mmap_offset
-    struct vm_area_struct *vma_iter = *(struct vm_area_struct **)((uintptr_t)mm + 0); 
-
+    // 修复: 放弃使用编译器不认识的结构体成员，直接使用 GKI 标准偏移量
+    unsigned long vma = *(unsigned long *)((unsigned long)mm + 0x0); // mm->mmap (偏移 0x0)
+    
     if (kf_down_read) kfunc(down_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
 
-    while (vma_iter) {
-        if (vma_iter->vm_file) {
-            // 从 file 结构体获取 dentry
-            struct dentry *dentry = *(struct dentry **)((uintptr_t)vma_iter->vm_file + 0x18); // f_path.dentry 偏移
-            if (dentry && dentry->d_name.name) {
-                // 简单匹配字符串
-                if (strstr(dentry->d_name.name, kreq.module_name) != NULL) {
-                    found_base = vma_iter->vm_start;
+    while (vma) {
+        unsigned long vm_start = *(unsigned long *)(vma + 0x0);  // vm_start (偏移 0x0)
+        unsigned long vm_file  = *(unsigned long *)(vma + 0x90); // vm_file (偏移 0x90)
+        
+        if (vm_file) {
+            // 修复: file->f_path.dentry (偏移 0x18)
+            unsigned long dentry = *(unsigned long *)(vm_file + 0x18); 
+            if (dentry) {
+                // 修复: dentry->d_name.name (偏移 0x28)
+                char *name = *(char **)(dentry + 0x28);
+                if (name && kf_strstr && kf_strstr(name, kreq.module_name) != NULL) {
+                    found_base = vm_start;
                     break;
                 }
             }
         }
-        // vm_next 偏移通常是 8
-        vma_iter = *(struct vm_area_struct **)((uintptr_t)vma_iter + 8);
+        // 修复: vm_next (偏移 0x10)
+        vma = *(unsigned long *)(vma + 0x10); 
     }
 
     if (kf_up_read) kfunc(up_read)((void *)((uintptr_t)mm + mmap_lock_sem_offset));
@@ -342,10 +344,9 @@ static long module_init_handler(const char *args, const char *event, void *__use
     kf___rcu_read_unlock = (typeof(kf___rcu_read_unlock))hmkpm_lookup_symbol("__rcu_read_unlock");
     kf_down_read = (typeof(kf_down_read))hmkpm_lookup_symbol("down_read");
     kf_up_read = (typeof(kf_up_read))hmkpm_lookup_symbol("up_read");
-    kf_kmalloc = (typeof(kf_kmalloc))hmkpm_lookup_symbol("__kmalloc");
-    kf_kfree = (typeof(kf_kfree))hmkpm_lookup_symbol("kfree");
+    kf_strstr = (typeof(kf_strstr))hmkpm_lookup_symbol("strstr"); // 解析 strstr
 
-    if (!kf___arch_copy_to_user || !kf___arch_copy_from_user || !kf_find_task_by_vpid) return -ENOENT;
+    if (!kf___arch_copy_to_user || !kf___arch_copy_from_user || !kf_find_task_by_vpid || !kf_strstr) return -ENOENT;
 
     unsigned long do_mem_abort_addr = hmkpm_lookup_symbol("do_mem_abort");
     if (!do_mem_abort_addr) return -ENOENT;
