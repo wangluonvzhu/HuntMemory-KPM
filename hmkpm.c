@@ -22,7 +22,7 @@
 #include <syscall.h>
 
 KPM_NAME("sys_trace");
-KPM_VERSION("1.0.0");
+KPM_VERSION("1.0.2");
 KPM_LICENSE("GPL v2");
 
 #define GHOST_SYSCALL_NR    __NR_futex
@@ -50,7 +50,7 @@ struct ghost_req {
 
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
-struct task_struct *kvar_def(init_task); // 用于遍历进程
+struct task_struct *kvar_def(init_task);
 
 void *kfunc_def(memset)(void *s, int c, size_t count);
 unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
@@ -152,12 +152,20 @@ static int pgt_pgtable_init(void) {
     pgt_page_offset = -(UL(1) << va1_bits);
 
     kv_memstart_addr = (typeof(kv_memstart_addr))kallsyms_lookup_name("memstart_addr");
-    if (!kv_memstart_addr) return -EFAULT;
+    if (!kv_memstart_addr) {
+        pr_err("hmkpm: [FAIL] memstart_addr not found\n");
+        return -EFAULT;
+    }
     pgt_phys_offset = *(u64 *)kv_memstart_addr;
     pgt_linear_voffset = pgt_page_offset - pgt_phys_offset;
 
     kv_high_memory = (typeof(kv_high_memory))kallsyms_lookup_name("high_memory");
-    pgt_high_memory = kv_high_memory ? *(u64 *)kv_high_memory : U64_MAX;
+    if (kv_high_memory) {
+        pgt_high_memory = *(u64 *)kv_high_memory;
+    } else {
+        pr_warn("hmkpm: [WARN] high_memory not found, using U64_MAX fallback\n");
+        pgt_high_memory = U64_MAX;
+    }
     return 0;
 }
 
@@ -200,7 +208,7 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 }
 
 // ==========================================
-// 纯内核态：进程与模块基址解析 (5.10 GKI 偏移)
+// 纯内核态：进程与模块基址解析
 // ==========================================
 static int resolve_pid_by_name(const char *pkg_name) {
     uint64_t init_task_addr = (uint64_t)kv_init_task;
@@ -240,19 +248,16 @@ static uint64_t resolve_base_by_name(int pid, const char *so_name) {
     struct task_struct *task = kfunc(find_task_by_vpid)(pid);
     if (!task) return 0;
     
-    // task->mm (5.10 偏移 0x540)
     uint64_t mm_addr = 0;
     if (kfunc(copy_from_kernel_nofault)(&mm_addr, (void*)((uint64_t)task + 0x540), 8)) return 0;
     if (!mm_addr) return 0;
     
-    // mm->mmap (5.10 偏移 0x0)
     uint64_t vma_addr = 0;
     if (kfunc(copy_from_kernel_nofault)(&vma_addr, (void*)(mm_addr + 0x0), 8)) return 0;
     
     uint64_t target_base = 0;
     while (vma_addr) {
         uint64_t vm_start = 0, vm_flags = 0, vm_file = 0, vm_next = 0;
-        // vma 结构体偏移
         kfunc(copy_from_kernel_nofault)(&vm_start, (void*)(vma_addr + 0x0), 8);
         kfunc(copy_from_kernel_nofault)(&vm_flags, (void*)(vma_addr + 0x50), 8);
         kfunc(copy_from_kernel_nofault)(&vm_file,  (void*)(vma_addr + 0x98), 8);
@@ -260,10 +265,8 @@ static uint64_t resolve_base_by_name(int pid, const char *so_name) {
         
         if (vm_file) {
             uint64_t dentry = 0;
-            // file->f_path.dentry (0x18)
             if (kfunc(copy_from_kernel_nofault)(&dentry, (void*)(vm_file + 0x18), 8) == 0 && dentry) {
                 uint64_t name_ptr = 0;
-                // dentry->d_name.name (0x28)
                 if (kfunc(copy_from_kernel_nofault)(&name_ptr, (void*)(dentry + 0x28), 8) == 0 && name_ptr) {
                     char name[256] = {0};
                     if (kfunc(copy_from_kernel_nofault)(name, (void*)name_ptr, 255) == 0) {
@@ -328,8 +331,15 @@ static void ghost_syscall_before(hook_fargs6_t *args, void *udata) {
     args->ret = ret;
 }
 
+// ==========================================
+// 模块初始化与退出（详尽诊断版）
+// ==========================================
 static long module_init_handler(const char *args, const char *event, void *__user reserved) {
+    pr_info("hmkpm: [INIT] Starting initialization...\n");
+
     kv_init_task = (typeof(kv_init_task))kallsyms_lookup_name("init_task");
+    if (!kv_init_task) { pr_err("hmkpm: [FAIL] init_task not found\n"); return -ENOENT; }
+
     kf___arch_copy_to_user = (typeof(kf___arch_copy_to_user))kallsyms_lookup_name("__arch_copy_to_user");
     kf___arch_copy_from_user = (typeof(kf___arch_copy_from_user))kallsyms_lookup_name("__arch_copy_from_user");
     kf_copy_from_kernel_nofault = (typeof(kf_copy_from_kernel_nofault))kallsyms_lookup_name("copy_from_kernel_nofault");
@@ -337,16 +347,37 @@ static long module_init_handler(const char *args, const char *event, void *__use
     kf_get_task_mm = (typeof(kf_get_task_mm))kallsyms_lookup_name("get_task_mm");
     kf_mmput = (typeof(kf_mmput))kallsyms_lookup_name("mmput");
 
-    if (pgt_pgtable_init() != 0) return -ENOENT;
-    if (!kv_init_task) return -ENOENT;
+    if (!kf___arch_copy_to_user) { pr_err("hmkpm: [FAIL] __arch_copy_to_user not found\n"); return -ENOENT; }
+    if (!kf___arch_copy_from_user) { pr_err("hmkpm: [FAIL] __arch_copy_from_user not found\n"); return -ENOENT; }
+    if (!kf_copy_from_kernel_nofault) { pr_err("hmkpm: [FAIL] copy_from_kernel_nofault not found\n"); return -ENOENT; }
+    if (!kf_find_task_by_vpid) { pr_err("hmkpm: [FAIL] find_task_by_vpid not found\n"); return -ENOENT; }
+    if (!kf_get_task_mm) { pr_err("hmkpm: [FAIL] get_task_mm not found\n"); return -ENOENT; }
+    if (!kf_mmput) { pr_err("hmkpm: [FAIL] mmput not found\n"); return -ENOENT; }
 
-    hook_err_t err = inline_hook_syscalln(GHOST_SYSCALL_NR, 6, ghost_syscall_before, 0, 0);
-    if (err) return -ENOENT;
+    if (pgt_pgtable_init() != 0) {
+        pr_err("hmkpm: [FAIL] pgt_pgtable_init failed (check memstart_addr)\n");
+        return -ENOENT;
+    }
 
+    // 优先尝试 fp_hook（对 CFI 内核更稳定）
+    pr_info("hmkpm: [INIT] Trying fp_hook_syscalln...\n");
+    hook_err_t err = fp_hook_syscalln(GHOST_SYSCALL_NR, 6, ghost_syscall_before, 0, 0);
+    if (err) {
+        pr_warn("hmkpm: [WARN] fp_hook_syscalln failed (err=%d), trying inline_hook_syscalln...\n", err);
+        err = inline_hook_syscalln(GHOST_SYSCALL_NR, 6, ghost_syscall_before, 0, 0);
+    }
+    
+    if (err) {
+        pr_err("hmkpm: [FAIL] both hook methods failed, last err=%d\n", err);
+        return -ENOENT;
+    }
+
+    pr_info("hmkpm: [SUCCESS] module loaded successfully\n");
     return 0;
 }
 
 static long module_cleanup_handler(void *__user reserved) {
+    fp_unhook_syscalln(GHOST_SYSCALL_NR, ghost_syscall_before, 0);
     inline_unhook_syscalln(GHOST_SYSCALL_NR, ghost_syscall_before, 0);
     return 0;
 }
