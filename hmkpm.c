@@ -1,9 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * KPM Module - Ghost Read
- * 隐蔽物理直读系统 (已脱敏，无 do_mem_abort 异常 Hook)
- */
-
 #include <asm/current.h>
 #include <common.h>
 #include <compiler.h>
@@ -26,26 +21,17 @@
 #include <uapi/asm-generic/unistd.h>
 #include <syscall.h>
 
-// === 针对 5.10 内核编译环境补充的必要头文件 ===
-#include <linux/mm.h>
-#include <linux/fs.h>
-#include <linux/list.h>
-// 注意：已删除 <linux/sched/signal.h>，改用 init_task 遍历
-
 // ==========================================
 // 脱敏与伪装
 // ==========================================
-KPM_NAME("sys_trace");    // 伪装成一个无害的系统追踪模块
+KPM_NAME("sys_trace");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 
 #define GHOST_SYSCALL_NR    __NR_futex      // 伪装进 futex 系统调用 (98)
 #define GHOST_MAGIC         0x1A2B3C4D      // 脱敏魔数
-#define CMD_GET_PID         0x11
-#define CMD_GET_BASE        0x22
-#define CMD_READ_MEM        0x33
+#define CMD_READ_MEM        0x33            // 只保留读取命令
 
-// 结构体加入 padding，破坏特征库
 struct ghost_req {
     uint32_t pid;
     uint32_t _pad1;
@@ -68,7 +54,6 @@ struct ghost_req {
 // ==========================================
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
-struct task_struct *kvar_def(init_task); // 新增 init_task 用于遍历进程
 
 void *kfunc_def(memset)(void *s, int c, size_t count);
 unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
@@ -77,11 +62,9 @@ long kfunc_def(copy_from_kernel_nofault)(void *dst, const void *src, size_t size
 struct task_struct *kfunc_def(find_task_by_vpid)(pid_t pid);
 struct mm_struct *kfunc_def(get_task_mm)(struct task_struct *task);
 void kfunc_def(mmput)(struct mm_struct *mm);
-void kfunc_def(__rcu_read_lock)(void);
-void kfunc_def(__rcu_read_unlock)(void);
 
 // ==========================================
-// 物理内存直读核心 (原样保留你的逻辑)
+// 物理内存直读核心 (原样保留)
 // ==========================================
 static uint64_t pgt_va_bits, pgt_phys_offset, pgt_page_offset, pgt_linear_voffset;
 static uint64_t pgt_page_shift, pgt_page_size, pgt_pgd_align_mask, pgt_pgd_size;
@@ -195,7 +178,6 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
     uint8_t bounce[512];
 
     if (!mm) return -ESRCH;
-    // 使用 mm_struct_offset.pgd_offset 兼容不同内核版本
     if (kfunc(copy_from_kernel_nofault)(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(pgd)) != 0 || !pgd) return -EFAULT;
 
     while (len > 0) {
@@ -210,7 +192,6 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
         }
 
         void *tkva = (void *)pgt_phys_to_virt(tkpa);
-        // 只读逻辑
         hmkpm_memcpy(bounce, tkva, chunk);
 
         if (kfunc(__arch_copy_to_user)(local_buf, bounce, chunk) != 0) break;
@@ -219,47 +200,6 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
         remote_va += chunk; len -= chunk;
     }
     return total;
-}
-
-// ==========================================
-// 内核态目标进程与基址解析 (兼容 5.10)
-// ==========================================
-static int resolve_pid_by_name(const char *pkg_name) {
-    struct task_struct *task;
-    struct list_head *pos, *task_list;
-    size_t target_len = strlen(pkg_name);
-    if (target_len > 15) target_len = 15;
-
-    if (!kv_init_task) return -1;
-
-    task_list = &kv_init_task->tasks;
-    for (pos = task_list->next; pos != task_list; pos = pos->next) {
-        task = list_entry(pos, struct task_struct, tasks);
-        if (task->comm && strncmp(task->comm, pkg_name, target_len) == 0) {
-            return task->pid;
-        }
-    }
-    return -1;
-}
-
-static uint64_t resolve_base_by_name(struct mm_struct *mm, const char *so_name) {
-    struct vm_area_struct *vma;
-    uint64_t base = 0;
-    if (!mm) return 0;
-
-    // 5.10 内核链表遍历
-    for (vma = mm->mmap; vma; vma = vma->vm_next) {
-        if (vma->vm_file) {
-            const char *path = (const char *)vma->vm_file->f_path.dentry->d_name.name;
-            if (path && strstr(path, so_name)) {
-                // 确保是可执行段，且取最低的地址作为基址
-                if ((vma->vm_flags & VM_EXEC) && (vma->vm_start < base || base == 0)) {
-                    base = vma->vm_start;
-                }
-            }
-        }
-    }
-    return base;
 }
 
 // ==========================================
@@ -282,45 +222,20 @@ static void ghost_syscall_before(hook_fargs6_t *args, void *udata) {
     struct task_struct *task;
     struct mm_struct *mm;
 
-    switch (req.cmd) {
-        case CMD_GET_PID: {
-            char pkg[64] = {0};
-            if (kfunc(__arch_copy_from_user)(pkg, (void __user *)req.addr, sizeof(pkg)-1) == 0) {
-                ret = resolve_pid_by_name(pkg);
-            }
-            break;
+    if (req.cmd == CMD_READ_MEM) {
+        task = kfunc(find_task_by_vpid)(req.pid);
+        if (task && (mm = kfunc(get_task_mm)(task))) {
+            long read_ret = pgt_rw_mm(mm, req.addr, req.size, (void __user *)req.user_buf, false);
+            ret = (read_ret == (long)req.size) ? 0 : -EFAULT;
+            kfunc(mmput)(mm);
         }
-        case CMD_GET_BASE:
-            task = kfunc(find_task_by_vpid)(req.pid);
-            if (task && (mm = kfunc(get_task_mm)(task))) {
-                char soname[64] = {0};
-                if (kfunc(__arch_copy_from_user)(soname, (void __user *)req.addr, sizeof(soname)-1) == 0) {
-                    ret = resolve_base_by_name(mm, soname);
-                }
-                kfunc(mmput)(mm);
-            }
-            break;
-
-        case CMD_READ_MEM:
-            task = kfunc(find_task_by_vpid)(req.pid);
-            if (task && (mm = kfunc(get_task_mm)(task))) {
-                long read_ret = pgt_rw_mm(mm, req.addr, req.size, (void __user *)req.user_buf, false);
-                ret = (read_ret == (long)req.size) ? 0 : -EFAULT;
-                kfunc(mmput)(mm);
-            }
-            break;
     }
 
     args->skip_origin = 1;
     args->ret = ret;
 }
 
-// ==========================================
-// 模块初始化与退出
-// ==========================================
 static long module_init_handler(const char *args, const char *event, void *__user reserved) {
-    kv_init_task = (typeof(kv_init_task))kallsyms_lookup_name("init_task");
-    
     kf___arch_copy_to_user = (typeof(kf___arch_copy_to_user))kallsyms_lookup_name("__arch_copy_to_user");
     kf___arch_copy_from_user = (typeof(kf___arch_copy_from_user))kallsyms_lookup_name("__arch_copy_from_user");
     kf_copy_from_kernel_nofault = (typeof(kf_copy_from_kernel_nofault))kallsyms_lookup_name("copy_from_kernel_nofault");
@@ -329,9 +244,7 @@ static long module_init_handler(const char *args, const char *event, void *__use
     kf_mmput = (typeof(kf_mmput))kallsyms_lookup_name("mmput");
 
     if (pgt_pgtable_init() != 0) return -ENOENT;
-    if (!kv_init_task) return -ENOENT;
 
-    // 拦截 Futex (98)
     hook_err_t err = inline_hook_syscalln(GHOST_SYSCALL_NR, 6, ghost_syscall_before, 0, 0);
     if (err) return -ENOENT;
 
