@@ -22,7 +22,7 @@
 #include <syscall.h>
 
 KPM_NAME("sys_trace");
-KPM_VERSION("1.0.2");
+KPM_VERSION("1.0.3");
 KPM_LICENSE("GPL v2");
 
 #define GHOST_SYSCALL_NR    __NR_futex
@@ -50,7 +50,7 @@ struct ghost_req {
 
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
-struct task_struct *kvar_def(init_task);
+void *kvar_def(init_task); // 用 void* 防止宏展开类型不匹配
 
 void *kfunc_def(memset)(void *s, int c, size_t count);
 unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
@@ -59,6 +59,8 @@ long kfunc_def(copy_from_kernel_nofault)(void *dst, const void *src, size_t size
 struct task_struct *kfunc_def(find_task_by_vpid)(pid_t pid);
 struct mm_struct *kfunc_def(get_task_mm)(struct task_struct *task);
 void kfunc_def(mmput)(struct mm_struct *mm);
+
+static bool g_is_ready = false; // 是否初始化全部成功
 
 // ==========================================
 // 物理内存直读核心
@@ -153,7 +155,7 @@ static int pgt_pgtable_init(void) {
 
     kv_memstart_addr = (typeof(kv_memstart_addr))kallsyms_lookup_name("memstart_addr");
     if (!kv_memstart_addr) {
-        pr_err("hmkpm: [FAIL] memstart_addr not found\n");
+        pr_err("hmkpm: [FAIL] memstart_addr symbol not found\n");
         return -EFAULT;
     }
     pgt_phys_offset = *(u64 *)kv_memstart_addr;
@@ -163,7 +165,7 @@ static int pgt_pgtable_init(void) {
     if (kv_high_memory) {
         pgt_high_memory = *(u64 *)kv_high_memory;
     } else {
-        pr_warn("hmkpm: [WARN] high_memory not found, using U64_MAX fallback\n");
+        pr_warn("hmkpm: [WARN] high_memory not found, using fallback\n");
         pgt_high_memory = U64_MAX;
     }
     return 0;
@@ -211,10 +213,10 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 // 纯内核态：进程与模块基址解析
 // ==========================================
 static int resolve_pid_by_name(const char *pkg_name) {
-    uint64_t init_task_addr = (uint64_t)kv_init_task;
-    if (!init_task_addr) return -1;
+    if (!kv_init_task) return -1;
+    uint64_t init_task_addr = (uint64_t)kv_init_task; // init_task 的地址
 
-    // 5.10 GKI 标准偏移
+    // 5.10 内核标准偏移 (骁龙8+绝大多数也是这个值)
     uint64_t tasks_off = 0x458;
     uint64_t comm_off  = 0x730;
     uint64_t pid_off   = 0x620;
@@ -245,6 +247,7 @@ static int resolve_pid_by_name(const char *pkg_name) {
 }
 
 static uint64_t resolve_base_by_name(int pid, const char *so_name) {
+    if (!kfunc(find_task_by_vpid)) return 0;
     struct task_struct *task = kfunc(find_task_by_vpid)(pid);
     if (!task) return 0;
     
@@ -296,6 +299,7 @@ static void ghost_syscall_before(hook_fargs6_t *args, void *udata) {
     uint64_t req_ptr = (uint64_t)syscall_argn(args, 1);
     struct ghost_req req;
 
+    if (!kfunc(__arch_copy_from_user)) return;
     if (kfunc(__arch_copy_from_user)(&req, (void __user *)req_ptr, sizeof(req))) {
         args->skip_origin = 1;
         args->ret = -14;
@@ -319,11 +323,13 @@ static void ghost_syscall_before(hook_fargs6_t *args, void *udata) {
         }
     }
     else if (req.cmd == CMD_READ_MEM) {
-        task = kfunc(find_task_by_vpid)(req.pid);
-        if (task && (mm = kfunc(get_task_mm)(task))) {
-            long read_ret = pgt_rw_mm(mm, req.addr, req.size, (void __user *)req.user_buf, false);
-            ret = (read_ret == (long)req.size) ? 0 : -EFAULT;
-            kfunc(mmput)(mm);
+        if (kfunc(find_task_by_vpid) && kfunc(get_task_mm)) {
+            task = kfunc(find_task_by_vpid)(req.pid);
+            if (task && (mm = kfunc(get_task_mm)(task))) {
+                long read_ret = pgt_rw_mm(mm, req.addr, req.size, (void __user *)req.user_buf, false);
+                ret = (read_ret == (long)req.size) ? 0 : -EFAULT;
+                if(kfunc(mmput)) kfunc(mmput)(mm);
+            }
         }
     }
 
@@ -332,14 +338,13 @@ static void ghost_syscall_before(hook_fargs6_t *args, void *udata) {
 }
 
 // ==========================================
-// 模块初始化与退出（详尽诊断版）
+// 模块初始化：强制加载并记录详细日志
 // ==========================================
 static long module_init_handler(const char *args, const char *event, void *__user reserved) {
-    pr_info("hmkpm: [INIT] Starting initialization...\n");
+    pr_info("hmkpm: [INIT] Starting diagnostic load...\n");
 
+    // 1. 查符号
     kv_init_task = (typeof(kv_init_task))kallsyms_lookup_name("init_task");
-    if (!kv_init_task) { pr_err("hmkpm: [FAIL] init_task not found\n"); return -ENOENT; }
-
     kf___arch_copy_to_user = (typeof(kf___arch_copy_to_user))kallsyms_lookup_name("__arch_copy_to_user");
     kf___arch_copy_from_user = (typeof(kf___arch_copy_from_user))kallsyms_lookup_name("__arch_copy_from_user");
     kf_copy_from_kernel_nofault = (typeof(kf_copy_from_kernel_nofault))kallsyms_lookup_name("copy_from_kernel_nofault");
@@ -347,38 +352,44 @@ static long module_init_handler(const char *args, const char *event, void *__use
     kf_get_task_mm = (typeof(kf_get_task_mm))kallsyms_lookup_name("get_task_mm");
     kf_mmput = (typeof(kf_mmput))kallsyms_lookup_name("mmput");
 
-    if (!kf___arch_copy_to_user) { pr_err("hmkpm: [FAIL] __arch_copy_to_user not found\n"); return -ENOENT; }
-    if (!kf___arch_copy_from_user) { pr_err("hmkpm: [FAIL] __arch_copy_from_user not found\n"); return -ENOENT; }
-    if (!kf_copy_from_kernel_nofault) { pr_err("hmkpm: [FAIL] copy_from_kernel_nofault not found\n"); return -ENOENT; }
-    if (!kf_find_task_by_vpid) { pr_err("hmkpm: [FAIL] find_task_by_vpid not found\n"); return -ENOENT; }
-    if (!kf_get_task_mm) { pr_err("hmkpm: [FAIL] get_task_mm not found\n"); return -ENOENT; }
-    if (!kf_mmput) { pr_err("hmkpm: [FAIL] mmput not found\n"); return -ENOENT; }
+    if (!kv_init_task)          pr_err("hmkpm: [FAIL] init_task not found\n");
+    if (!kf___arch_copy_to_user)pr_err("hmkpm: [FAIL] __arch_copy_to_user not found\n");
+    if (!kf___arch_copy_from_user) pr_err("hmkpm: [FAIL] __arch_copy_from_user not found\n");
+    if (!kf_copy_from_kernel_nofault) pr_err("hmkpm: [FAIL] copy_from_kernel_nofault not found\n");
+    if (!kf_find_task_by_vpid)  pr_err("hmkpm: [FAIL] find_task_by_vpid not found\n");
+    if (!kf_get_task_mm)        pr_err("hmkpm: [FAIL] get_task_mm not found\n");
+    if (!kf_mmput)              pr_err("hmkpm: [FAIL] mmput not found\n");
 
+    // 2. 查物理地址基址
     if (pgt_pgtable_init() != 0) {
-        pr_err("hmkpm: [FAIL] pgt_pgtable_init failed (check memstart_addr)\n");
-        return -ENOENT;
+        pr_err("hmkpm: [FAIL] pgt_pgtable_init failed (memstart_addr missing)\n");
     }
 
-    // 优先尝试 fp_hook（对 CFI 内核更稳定）
+    // 3. 尝试 Hook
     pr_info("hmkpm: [INIT] Trying fp_hook_syscalln...\n");
     hook_err_t err = fp_hook_syscalln(GHOST_SYSCALL_NR, 6, ghost_syscall_before, 0, 0);
     if (err) {
-        pr_warn("hmkpm: [WARN] fp_hook_syscalln failed (err=%d), trying inline_hook_syscalln...\n", err);
+        pr_warn("hmkpm: [WARN] fp_hook_syscalln failed (err=%d), trying inline_hook...\n", err);
         err = inline_hook_syscalln(GHOST_SYSCALL_NR, 6, ghost_syscall_before, 0, 0);
     }
     
     if (err) {
         pr_err("hmkpm: [FAIL] both hook methods failed, last err=%d\n", err);
-        return -ENOENT;
+    } else {
+        pr_info("hmkpm: [SUCCESS] syscall hook installed.\n");
+        g_is_ready = true;
     }
 
-    pr_info("hmkpm: [SUCCESS] module loaded successfully\n");
-    return 0;
+    // 无论如何，强制返回 0，让模块加载成功，这样我们才能看 dmesg！
+    pr_info("hmkpm: [INIT] Load sequence finished.\n");
+    return 0; 
 }
 
 static long module_cleanup_handler(void *__user reserved) {
-    fp_unhook_syscalln(GHOST_SYSCALL_NR, ghost_syscall_before, 0);
-    inline_unhook_syscalln(GHOST_SYSCALL_NR, ghost_syscall_before, 0);
+    if (g_is_ready) {
+        fp_unhook_syscalln(GHOST_SYSCALL_NR, ghost_syscall_before, 0);
+        inline_unhook_syscalln(GHOST_SYSCALL_NR, ghost_syscall_before, 0);
+    }
     return 0;
 }
 
