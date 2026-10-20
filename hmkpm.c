@@ -6,15 +6,24 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/uaccess.h>
-#include <linux/version.h>
-// 注意：这里移除了报错的 <linux/file.h> 和 <linux/anon_inodes.h>
-// 改为在下方手动声明所需的内核符号和函数
 
-KPM_NAME("com.sys.core"); 
-KPM_VERSION("1.0.0");
-KPM_LICENSE("GPL v2");
+// 【修复】移除了 linux/version.h 等缺失头文件
+// 手动定义缺失的常量与宏
+#ifndef O_RDWR
+#define O_RDWR 02
+#endif
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 02000000
+#endif
+#ifndef SOCK_RAW
+#define SOCK_RAW 3
+#endif
 
-// 【关键修复】手动声明 CI 环境中缺失的内核结构体与函数
+// 简易 IS_ERR 实现，避免引入 linux/err.h
+#define MY_IS_ERR_VALUE(x) ((unsigned long)(void *)(x) >= (unsigned long)-4095)
+#define MY_IS_ERR(ptr) MY_IS_ERR_VALUE((unsigned long)ptr)
+
+// 手动声明文件系统符号
 struct file_operations;
 struct file;
 extern struct file *anon_inode_getfile(const char *name, const struct file_operations *fops, void *priv, int flags);
@@ -22,6 +31,10 @@ extern int get_unused_fd_flags(unsigned flags);
 extern void put_unused_fd(unsigned int fd);
 extern void fd_install(unsigned int fd, struct file *file);
 extern const struct file_operations anon_inode_fops;
+
+KPM_NAME("com.sys.core"); 
+KPM_VERSION("1.0.0");
+KPM_LICENSE("GPL v2");
 
 #define AF_DECNET_VAL 12
 #define CMD_GET_PID   0x1001
@@ -46,12 +59,12 @@ struct k_req {
 #define KF_COPY_TO_USER ((unsigned long (*)(void __user*, const void*, unsigned long))kallsyms_lookup_name("__arch_copy_to_user"))
 #define KF_COPY_FROM_USER ((unsigned long (*)(void*, const void __user*, unsigned long))kallsyms_lookup_name("__arch_copy_from_user"))
 
-// 引入 hmkpm 原版的页表遍历函数 (确保原工程里有)
+// 引入 hmkpm 原版的页表遍历函数
 extern int pgt_pgtable_init(void);
 extern uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write);
 extern uint64_t pgt_phys_to_virt(uint64_t phys);
 
-// ==================== 核心 1：包名找 PID (移植自 wuwa) ====================
+// ==================== 核心 1：包名找 PID ====================
 static pid_t do_find_pid(const char *name) {
     struct task_struct *p;
     char cmdline[256];
@@ -77,7 +90,7 @@ static pid_t do_find_pid(const char *name) {
     return found_pid;
 }
 
-// ==================== 核心 2：获取模块基址 (移植自 wuwa) ====================
+// ==================== 核心 2：获取模块基址 ====================
 static unsigned long do_get_base(pid_t pid, const char *name) {
     struct task_struct *task = KF_FIND_TASK(pid);
     if (!task) return 0;
@@ -89,14 +102,9 @@ static unsigned long do_get_base(pid_t pid, const char *name) {
     unsigned long base = 0;
     size_t name_len = strlen(name);
     
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-    VMA_ITERATOR(vmi, mm, 0);
-    for_each_vma(vmi, vma) {
-#else
+    // 【修复】放弃 VMA_ITERATOR 条件编译，使用最基础的全内核通用遍历
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
-#endif
         if (vma->vm_file) {
-            // 注：如果这里报 dentry 错，可能还需手动前置声明 struct dentry; 但通常 KPM 自带
             const char *dname = vma->vm_file->f_path.dentry->d_name.name;
             if (dname && strncmp(dname, name, name_len) == 0) {
                 base = vma->vm_start;
@@ -135,9 +143,7 @@ static bool do_read_physical(int pid, uint64_t va, void *buf, uint64_t size) {
     return true;
 }
 
-// ==================== 通信层：完美复刻 wuwa 的 Socket 劫持 ====================
-
-// 1. Hook socket：拦截 AF_DECnet 并分配真实的匿名 fd
+// ==================== 通信层：复刻 wuwa 的 Socket 劫持 ====================
 static void before_socket(hook_fargs3_t *args, void *udata) {
     int family = (int)syscall_argn(args, 0);
     int type = (int)syscall_argn(args, 1);
@@ -147,52 +153,50 @@ static void before_socket(hook_fargs3_t *args, void *udata) {
         int fd = get_unused_fd_flags(O_CLOEXEC);
         if (fd >= 0) {
             struct file *filp = anon_inode_getfile("[net]", &anon_inode_fops, NULL, O_RDWR);
-            if (!IS_ERR(filp)) {
+            // 【修复】使用自定义的 MY_IS_ERR 宏
+            if (!MY_IS_ERR(filp)) {
                 fd_install(fd, filp);
                 args->ret = fd;
             } else {
                 put_unused_fd(fd);
-                args->ret = -EMFILE;
+                args->ret = -24; // -EMFILE
             }
         } else {
-            args->ret = -EMFILE;
+            args->ret = -24; // -EMFILE
         }
     }
 }
 
-// 2. Hook ioctl：解析请求
 static void before_ioctl(hook_fargs3_t *args, void *udata) {
     unsigned int cmd = (unsigned int)syscall_argn(args, 1);
     void __user *arg = (void __user *)syscall_argn(args, 2);
 
-    // 拦截自定义指令
     if (cmd < CMD_GET_PID || cmd > CMD_READ_MEM) return;
 
     args->skip_origin = 1;
 
     struct k_req req;
     if (KF_COPY_FROM_USER(&req, arg, sizeof(req)) != 0) {
-        args->ret = -EFAULT;
+        args->ret = -14; // -EFAULT
         return;
     }
 
     if (cmd == CMD_GET_PID) {
         req.pid = do_find_pid(req.name);
-        args->ret = (req.pid > 0) ? 0 : -ENOENT;
+        args->ret = (req.pid > 0) ? 0 : -2; // -ENOENT
     } 
     else if (cmd == CMD_GET_BASE) {
         req.addr = do_get_base(req.pid, req.name);
-        args->ret = (req.addr > 0) ? 0 : -ENOENT;
+        args->ret = (req.addr > 0) ? 0 : -2; // -ENOENT
     } 
     else if (cmd == CMD_READ_MEM) {
         bool ok = do_read_physical(req.pid, req.addr, (void*)req.buf, req.size);
-        args->ret = ok ? 0 : -EFAULT;
+        args->ret = ok ? 0 : -14; // -EFAULT
     }
     else {
-        args->ret = -EINVAL;
+        args->ret = -22; // -EINVAL
     }
 
-    // 回写数据给用户态
     if (args->ret == 0 && cmd != CMD_READ_MEM) {
         KF_COPY_TO_USER(arg, &req, sizeof(req));
     }
