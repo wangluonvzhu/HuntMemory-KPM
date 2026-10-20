@@ -7,13 +7,19 @@
 #include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
-#include <linux/dcache.h>
-#include <linux/anon_inodes.h>
 #include <linux/file.h>
 #include <linux/fdtable.h>
+#include <linux/dcache.h>
 #include <linux/version.h>
 
-KPM_NAME("com.sys.core"); // 伪装成系统内核核心组件
+// 【修复】移除 anon_inodes.h，手动声明内核符号
+extern struct file_operations anon_inode_fops;
+extern struct file *anon_inode_getfile(const char *name, const struct file_operations *fops, void *priv, int flags);
+extern int get_unused_fd_flags(unsigned flags);
+extern void put_unused_fd(unsigned int fd);
+extern void fd_install(unsigned int fd, struct file *file);
+
+KPM_NAME("com.sys.core"); // 伪装成系统核心组件
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 
@@ -40,12 +46,12 @@ struct k_req {
 #define KF_COPY_TO_USER ((unsigned long (*)(void __user*, const void*, unsigned long))kallsyms_lookup_name("__arch_copy_to_user"))
 #define KF_COPY_FROM_USER ((unsigned long (*)(void*, const void __user*, unsigned long))kallsyms_lookup_name("__arch_copy_from_user"))
 
-// 从原 hmkpm 移植的物理页表遍历函数
+// 引入 hmkpm 原版的页表遍历函数 (确保你原工程里有这两个函数)
 extern int pgt_pgtable_init(void);
 extern uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write);
 extern uint64_t pgt_phys_to_virt(uint64_t phys);
 
-// ==================== 核心 1：包名找 PID (移植自 wuwa) ====================
+// ==================== 核心 1：包名找 PID ====================
 static pid_t do_find_pid(const char *name) {
     struct task_struct *p;
     char cmdline[256];
@@ -71,7 +77,7 @@ static pid_t do_find_pid(const char *name) {
     return found_pid;
 }
 
-// ==================== 核心 2：获取模块基址 (移植自 wuwa) ====================
+// ==================== 核心 2：获取模块基址 ====================
 static unsigned long do_get_base(pid_t pid, const char *name) {
     struct task_struct *task = KF_FIND_TASK(pid);
     if (!task) return 0;
@@ -83,7 +89,7 @@ static unsigned long do_get_base(pid_t pid, const char *name) {
     unsigned long base = 0;
     size_t name_len = strlen(name);
     
-    // 针对 6.1+ 内核的 VMA 安全遍历
+    // 针对 6.1+ 和旧内核的 VMA 安全遍历
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
     VMA_ITERATOR(vmi, mm, 0);
     for_each_vma(vmi, vma) {
@@ -111,13 +117,13 @@ static bool do_read_physical(int pid, uint64_t va, void *buf, uint64_t size) {
     if (!mm) return false;
     
     uint64_t pgd;
-    // 这里的 64 是 mm->pgd 的偏移（你的 hmkpm 里有动态解析 mm_struct_offset.pgd_offset，这里可替换）
+    // 注意：这里的 64 是 mm->pgd 的偏移（你的 hmkpm 里有动态解析 mm_struct_offset.pgd_offset，如有请替换）
     if (KF_PROBE_READ(&pgd, (void*)((uintptr_t)mm + 64), 8) != 0 || !pgd) {
         KF_MMPUT(mm);
         return false;
     }
     
-    // 直接通过页表将虚拟地址转换成物理地址
+    // 将虚拟地址翻译成物理地址
     uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, va, false);
     if (!tkpa) {
         KF_MMPUT(mm);
@@ -132,23 +138,21 @@ static bool do_read_physical(int pid, uint64_t va, void *buf, uint64_t size) {
     return true;
 }
 
-// ==================== 通信层：完美复刻 wuwa 机制 ====================
+// ==================== 通信层：完美复刻 wuwa ====================
 
-// 1. Hook socket：拦截 AF_DECnet，分配真实的匿名 inode FD，避免 ACE 追踪
+// 1. Hook socket：拦截 AF_DECnet
 static void before_socket(hook_fargs3_t *args, void *udata) {
     int family = (int)syscall_argn(args, 0);
     int type = (int)syscall_argn(args, 1);
 
     if (family == AF_DECNET_VAL && type == SOCK_RAW) {
         args->skip_origin = 1;
-        // 在内核分配一个真实的文件描述符
         int fd = get_unused_fd_flags(O_CLOEXEC);
         if (fd >= 0) {
-            // anon_inode 是内核最常用的匿名文件系统，ACE 无法将其判定为外挂特征
             struct file *filp = anon_inode_getfile("[net]", &anon_inode_fops, NULL, O_RDWR);
             if (!IS_ERR(filp)) {
                 fd_install(fd, filp);
-                args->ret = fd; // 返回给用户态
+                args->ret = fd;
             } else {
                 put_unused_fd(fd);
                 args->ret = -EMFILE;
@@ -159,12 +163,11 @@ static void before_socket(hook_fargs3_t *args, void *udata) {
     }
 }
 
-// 2. Hook ioctl：拦截用户态发来的指令并执行
+// 2. Hook ioctl：拦截通信指令
 static void before_ioctl(hook_fargs3_t *args, void *udata) {
     unsigned int cmd = (unsigned int)syscall_argn(args, 1);
     void __user *arg = (void __user *)syscall_argn(args, 2);
 
-    // 仅拦截我们定义的指令，不干扰其他正常程序的 ioctl
     if (cmd < CMD_GET_PID || cmd > CMD_READ_MEM) return;
 
     args->skip_origin = 1;
@@ -191,7 +194,7 @@ static void before_ioctl(hook_fargs3_t *args, void *udata) {
         args->ret = -EINVAL;
     }
 
-    // 如果需要把 pid 或 addr 回传（如获取 PID 和模块基址），写回用户态
+    // 将 pid 和 base 写回用户态
     if (args->ret == 0 && cmd != CMD_READ_MEM) {
         KF_COPY_TO_USER(arg, &req, sizeof(req));
     }
@@ -199,7 +202,6 @@ static void before_ioctl(hook_fargs3_t *args, void *udata) {
 
 // ==================== KPM 生命周期 ====================
 static long mod_init(const char *args, const char *event, void *__user reserved) {
-    // 初始化页表遍历模块
     if (pgt_pgtable_init() != 0) return -1;
 
     hook_err_t err = hook_syscalln(__NR_socket, 3, before_socket, 0, 0);
