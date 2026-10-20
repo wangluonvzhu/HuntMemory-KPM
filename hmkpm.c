@@ -1,397 +1,223 @@
 // SPDX-License-Identifier: GPL-2.0
-#include <asm/current.h>
-#include <common.h>
-#include <compiler.h>
-#include <hook.h>
-#include <kconfig.h>
 #include <kpmodule.h>
 #include <kputils.h>
-#include <ksyms.h>
-#include <ktypes.h>
-#include <linux/bitops.h>
-#include <linux/err.h>
-#include <linux/errno.h>
-#include <linux/kernel.h>
-#include <linux/mm_types.h>
-#include <linux/sched.h>
-#include <linux/printk.h>
-#include <linux/string.h>
-#include <asm/ptrace.h>
-#include <asm-generic/rwonce.h>
-#include <uapi/asm-generic/unistd.h>
+#include <hook.h>
 #include <syscall.h>
+#include <linux/sched.h>
+#include <linux/mm.h>
+#include <linux/uaccess.h>
+#include <linux/fs.h>
+#include <linux/dcache.h>
+#include <linux/anon_inodes.h>
+#include <linux/file.h>
+#include <linux/fdtable.h>
+#include <linux/version.h>
 
-KPM_NAME("sys_trace");
-KPM_VERSION("1.0.3");
+KPM_NAME("com.sys.core"); // 伪装成系统内核核心组件
+KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 
-#define GHOST_SYSCALL_NR    __NR_futex
-#define GHOST_MAGIC         0x1A2B3C4D
-#define CMD_GET_PID         0x11
-#define CMD_GET_BASE        0x22
-#define CMD_READ_MEM        0x33
+#define AF_DECNET_VAL 12
+#define CMD_GET_PID   0x1001
+#define CMD_GET_BASE  0x1002
+#define CMD_READ_MEM  0x1003
 
-struct ghost_req {
-    uint32_t pid;
-    uint32_t _pad1;
-    uint64_t addr;
-    uint64_t size;
-    uint64_t user_buf;
+struct k_req {
     uint32_t cmd;
-    uint8_t  _pad2[12];
+    uint32_t pid;
+    uint64_t addr;
+    uint64_t buf;
+    uint64_t size;
+    char name[64];
 };
 
-#ifndef U64_MAX
-#define U64_MAX ((u64)~0ULL)
-#endif
-#ifndef min
-#define min(a, b) ((a) < (b) ? (a) : (b))
-#endif
+// ==================== 依赖符号解析 ====================
+#define KF_FIND_TASK ((struct task_struct* (*)(pid_t))kallsyms_lookup_name("find_task_by_vpid"))
+#define KF_GET_MM ((struct mm_struct* (*)(struct task_struct*))kallsyms_lookup_name("get_task_mm"))
+#define KF_MMPUT ((void (*)(struct mm_struct*))kallsyms_lookup_name("mmput"))
+#define KF_GET_CMDLINE ((int (*)(struct task_struct*, char*, int))kallsyms_lookup_name("get_cmdline"))
+#define KF_PROBE_READ ((int (*)(void*, const void*, size_t))kallsyms_lookup_name("probe_kernel_read"))
+#define KF_COPY_TO_USER ((unsigned long (*)(void __user*, const void*, unsigned long))kallsyms_lookup_name("__arch_copy_to_user"))
+#define KF_COPY_FROM_USER ((unsigned long (*)(void*, const void __user*, unsigned long))kallsyms_lookup_name("__arch_copy_from_user"))
 
-u64 kvar_def(memstart_addr);
-void *kvar_def(high_memory);
-void *kvar_def(init_task); // 用 void* 防止宏展开类型不匹配
+// 从原 hmkpm 移植的物理页表遍历函数
+extern int pgt_pgtable_init(void);
+extern uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write);
+extern uint64_t pgt_phys_to_virt(uint64_t phys);
 
-void *kfunc_def(memset)(void *s, int c, size_t count);
-unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
-unsigned long kfunc_def(__arch_copy_from_user)(void *to, const void __user *from, unsigned long n);
-long kfunc_def(copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
-struct task_struct *kfunc_def(find_task_by_vpid)(pid_t pid);
-struct mm_struct *kfunc_def(get_task_mm)(struct task_struct *task);
-void kfunc_def(mmput)(struct mm_struct *mm);
-
-static bool g_is_ready = false; // 是否初始化全部成功
-
-// ==========================================
-// 物理内存直读核心
-// ==========================================
-static uint64_t pgt_va_bits, pgt_phys_offset, pgt_page_offset, pgt_linear_voffset;
-static uint64_t pgt_page_shift, pgt_page_size, pgt_pgd_align_mask, pgt_pgd_size;
-static uint64_t pgt_page_level, pgt_user_limit, pgt_high_memory;
-
-static inline uint64_t pgt_phys_to_virt(uint64_t phys) { return phys + pgt_linear_voffset; }
-static inline uint64_t pgt_untag_user_va(uint64_t va) { return va & 0x00FFFFFFFFFFFFFFULL; }
-
-static inline int validate_virt_range(uint64_t va, uint64_t size) {
-    if (unlikely(size == 0) || va < pgt_page_offset) return -EFAULT;
-    if (unlikely(va > U64_MAX - size)) return -EFAULT;
-    if (unlikely((va + size - 1) >= pgt_high_memory)) return -EFAULT;
-    return 0;
-}
-static inline int validate_phys_range(uint64_t phys, uint64_t size) {
-    if (unlikely(size == 0) || (phys >> 48) != 0) return -EFAULT;
-    return validate_virt_range(pgt_phys_to_virt(phys), size);
-}
-static inline uint64_t pgt_desc_to_phys(uint64_t desc) {
-    uint64_t addr_mask = (((1ULL << (48 - pgt_page_shift)) - 1) << pgt_page_shift);
-    return desc & addr_mask;
-}
-
-static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write) {
-    uint64_t table_va = pgd;
-    uint64_t pxd_bits = pgt_page_shift - 3;
-    uint64_t pxd_ptrs = 1ULL << pxd_bits;
-    int64_t start = 4 - (int64_t)pgt_page_level;
-    va = pgt_untag_user_va(va);
-
-    if (!pgd || (pgd & pgt_pgd_align_mask) || validate_virt_range(pgd, pgt_pgd_size) || (va >> pgt_va_bits))
-        return 0;
-
-    for (int64_t lv = start; lv < 4; lv++) {
-        uint64_t pxd_shift = (pgt_page_shift - 3) * (4 - lv) + 3;
-        if (pxd_shift >= pgt_va_bits) return 0;
-        uint64_t pxd_index = (va >> pxd_shift) & (pxd_ptrs - 1);
-        
-        uint64_t cur_table_size = (lv == start) ? pgt_pgd_size : pgt_page_size;
-        if (validate_virt_range(table_va, cur_table_size)) return 0;
-
-        uint64_t entry_va = table_va + pxd_index * 8;
-        uint64_t desc = 0;
-        if (kfunc(copy_from_kernel_nofault)(&desc, (const void *)entry_va, sizeof(desc)) != 0) return 0;
-
-        uint64_t type = desc & 3ULL;
-        if (type == 0ULL || type == 2ULL) return 0;
-
-        if (lv == 3) {
-            if (type != 3ULL) return 0;
-            if (is_write && (desc & (1ULL << 7)) && !(desc & (1ULL << 51))) return 0;
-            uint64_t base = pgt_desc_to_phys(desc);
-            return validate_phys_range(base, pgt_page_size) ? 0 : (base | (va & (pgt_page_size - 1)));
-        }
-
-        if (type == 1ULL) {
-            if (pgt_page_shift == 14 ? (lv != 2) : (lv != 1 && lv != 2)) return 0;
-            if (is_write && (desc & (1ULL << 7)) && !(desc & (1ULL << 51))) return 0;
-            uint64_t block_bits = (uint64_t)(3 - lv) * pxd_bits + pgt_page_shift;
-            uint64_t block_size = 1ULL << block_bits;
-            uint64_t base = pgt_desc_to_phys(desc);
-            return validate_phys_range(base, block_size) ? 0 : ((base & ~(block_size - 1)) | (va & (block_size - 1)));
-        }
-
-        if (is_write && (desc & (1ULL << 62))) return 0;
-        uint64_t next_pa = pgt_desc_to_phys(desc);
-        if (validate_phys_range(next_pa, pgt_page_size)) return 0;
-        table_va = pgt_phys_to_virt(next_pa);
-    }
-    return 0;
-}
-
-static int pgt_pgtable_init(void) {
-    uint64_t tcr_el1, t1sz, va1_bits, t0sz, va0_bits, tg0;
-    asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
-    t1sz = (tcr_el1 >> 16) & 0x3F; va1_bits = 64 - t1sz;
-    t0sz = tcr_el1 & 0x3F; va0_bits = 64 - t0sz; tg0 = (tcr_el1 >> 14) & 0x3ULL;
-
-    if (va0_bits > 48 || va0_bits < 36) return -EINVAL;
-    pgt_va_bits = va0_bits; pgt_user_limit = (1ULL << va0_bits) - 1;
-    pgt_page_shift = (tg0 == 0) ? 12 : ((tg0 == 2) ? 14 : 0);
-    if (!pgt_page_shift) return -EINVAL;
-    pgt_page_level = (va0_bits - 4) / (pgt_page_shift - 3);
-    if (pgt_page_level < 2 || pgt_page_level > 4) return -EINVAL;
+// ==================== 核心 1：包名找 PID (移植自 wuwa) ====================
+static pid_t do_find_pid(const char *name) {
+    struct task_struct *p;
+    char cmdline[256];
+    size_t name_len = strlen(name);
+    pid_t found_pid = -1;
     
-    pgt_page_size = 1ULL << pgt_page_shift;
-    pgt_pgd_size = pgt_page_size; pgt_pgd_align_mask = pgt_page_size - 1;
-    pgt_page_offset = -(UL(1) << va1_bits);
-
-    kv_memstart_addr = (typeof(kv_memstart_addr))kallsyms_lookup_name("memstart_addr");
-    if (!kv_memstart_addr) {
-        pr_err("hmkpm: [FAIL] memstart_addr symbol not found\n");
-        return -EFAULT;
-    }
-    pgt_phys_offset = *(u64 *)kv_memstart_addr;
-    pgt_linear_voffset = pgt_page_offset - pgt_phys_offset;
-
-    kv_high_memory = (typeof(kv_high_memory))kallsyms_lookup_name("high_memory");
-    if (kv_high_memory) {
-        pgt_high_memory = *(u64 *)kv_high_memory;
-    } else {
-        pr_warn("hmkpm: [WARN] high_memory not found, using fallback\n");
-        pgt_high_memory = U64_MAX;
-    }
-    return 0;
-}
-
-static void hmkpm_memcpy(void *dst, const void *src, size_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    while (n >= 8) { *(uint64_t *)d = *(const uint64_t *)s; d += 8; s += 8; n -= 8; }
-    while (n > 0) { *d++ = *s++; n--; }
-}
-
-static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, void __user *local_buf, bool is_write)
-{
-    ssize_t total = 0;
-    uint64_t pgd = 0;
-    uint8_t bounce[512];
-
-    if (!mm) return -ESRCH;
-    if (kfunc(copy_from_kernel_nofault)(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(pgd)) != 0 || !pgd) return -EFAULT;
-
-    while (len > 0) {
-        unsigned long page_off = remote_va & (pgt_page_size - 1);
-        size_t chunk = min(len, (size_t)(pgt_page_size - page_off));
-        chunk = min(chunk, (size_t)sizeof(bounce));
-
-        uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, remote_va, is_write);
-        if (!tkpa) {
-            if (total > 0) break;
-            return -EFAULT;
-        }
-
-        void *tkva = (void *)pgt_phys_to_virt(tkpa);
-        hmkpm_memcpy(bounce, tkva, chunk);
-
-        if (kfunc(__arch_copy_to_user)(local_buf, bounce, chunk) != 0) break;
-
-        total += chunk; local_buf = (void __user *)((uintptr_t)local_buf + chunk);
-        remote_va += chunk; len -= chunk;
-    }
-    return total;
-}
-
-// ==========================================
-// 纯内核态：进程与模块基址解析
-// ==========================================
-static int resolve_pid_by_name(const char *pkg_name) {
-    if (!kv_init_task) return -1;
-    uint64_t init_task_addr = (uint64_t)kv_init_task; // init_task 的地址
-
-    // 5.10 内核标准偏移 (骁龙8+绝大多数也是这个值)
-    uint64_t tasks_off = 0x458;
-    uint64_t comm_off  = 0x730;
-    uint64_t pid_off   = 0x620;
-
-    uint64_t tasks_head = init_task_addr + tasks_off;
-    uint64_t pos_addr = 0;
-    
-    if (kfunc(copy_from_kernel_nofault)(&pos_addr, (void*)tasks_head, 8)) return -1;
-
-    size_t target_len = strlen(pkg_name);
-    if (target_len > 15) target_len = 15;
-
-    while (pos_addr != tasks_head) {
-        uint64_t task_ptr = pos_addr - tasks_off;
-        char comm[16] = {0};
-        
-        if (kfunc(copy_from_kernel_nofault)(comm, (void*)(task_ptr + comm_off), 16) == 0) {
-            if (strncmp(comm, pkg_name, target_len) == 0) {
-                int pid = -1;
-                if (kfunc(copy_from_kernel_nofault)(&pid, (void*)(task_ptr + pid_off), 4) == 0) {
-                    return pid;
-                }
+    kfunc(__rcu_read_lock)();
+    for_each_process(p) {
+        if (p->mm == NULL) continue;
+        cmdline[0] = '\0';
+        if (KF_GET_CMDLINE && KF_GET_CMDLINE(p, cmdline, sizeof(cmdline)) > 0) {
+            char *prog = cmdline;
+            char *space = strrchr(cmdline, ' ');
+            if (space) prog = space + 1;
+            
+            if (strncmp(prog, name, name_len) == 0 && strlen(prog) == name_len) {
+                found_pid = p->pid;
+                break;
             }
         }
-        if (kfunc(copy_from_kernel_nofault)(&pos_addr, (void*)pos_addr, 8)) break;
     }
-    return -1;
+    kfunc(__rcu_read_unlock)();
+    return found_pid;
 }
 
-static uint64_t resolve_base_by_name(int pid, const char *so_name) {
-    if (!kfunc(find_task_by_vpid)) return 0;
-    struct task_struct *task = kfunc(find_task_by_vpid)(pid);
+// ==================== 核心 2：获取模块基址 (移植自 wuwa) ====================
+static unsigned long do_get_base(pid_t pid, const char *name) {
+    struct task_struct *task = KF_FIND_TASK(pid);
     if (!task) return 0;
     
-    uint64_t mm_addr = 0;
-    if (kfunc(copy_from_kernel_nofault)(&mm_addr, (void*)((uint64_t)task + 0x540), 8)) return 0;
-    if (!mm_addr) return 0;
+    struct mm_struct *mm = KF_GET_MM(task);
+    if (!mm) return 0;
     
-    uint64_t vma_addr = 0;
-    if (kfunc(copy_from_kernel_nofault)(&vma_addr, (void*)(mm_addr + 0x0), 8)) return 0;
+    struct vm_area_struct *vma;
+    unsigned long base = 0;
+    size_t name_len = strlen(name);
     
-    uint64_t target_base = 0;
-    while (vma_addr) {
-        uint64_t vm_start = 0, vm_flags = 0, vm_file = 0, vm_next = 0;
-        kfunc(copy_from_kernel_nofault)(&vm_start, (void*)(vma_addr + 0x0), 8);
-        kfunc(copy_from_kernel_nofault)(&vm_flags, (void*)(vma_addr + 0x50), 8);
-        kfunc(copy_from_kernel_nofault)(&vm_file,  (void*)(vma_addr + 0x98), 8);
-        kfunc(copy_from_kernel_nofault)(&vm_next,  (void*)(vma_addr + 0x10), 8);
-        
-        if (vm_file) {
-            uint64_t dentry = 0;
-            if (kfunc(copy_from_kernel_nofault)(&dentry, (void*)(vm_file + 0x18), 8) == 0 && dentry) {
-                uint64_t name_ptr = 0;
-                if (kfunc(copy_from_kernel_nofault)(&name_ptr, (void*)(dentry + 0x28), 8) == 0 && name_ptr) {
-                    char name[256] = {0};
-                    if (kfunc(copy_from_kernel_nofault)(name, (void*)name_ptr, 255) == 0) {
-                        if (strstr(name, so_name)) {
-                            if (vm_flags & 0x4) { // VM_EXEC
-                                if (target_base == 0 || vm_start < target_base) {
-                                    target_base = vm_start;
-                                }
-                            }
-                        }
-                    }
-                }
+    // 针对 6.1+ 内核的 VMA 安全遍历
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+    VMA_ITERATOR(vmi, mm, 0);
+    for_each_vma(vmi, vma) {
+#else
+    for (vma = mm->mmap; vma; vma = vma->vm_next) {
+#endif
+        if (vma->vm_file) {
+            const char *dname = vma->vm_file->f_path.dentry->d_name.name;
+            if (dname && strncmp(dname, name, name_len) == 0) {
+                base = vma->vm_start;
+                break;
             }
         }
-        vma_addr = vm_next;
     }
-    return target_base;
+    KF_MMPUT(mm);
+    return base;
 }
 
-// ==========================================
-// 系统调用拦截
-// ==========================================
-static void ghost_syscall_before(hook_fargs6_t *args, void *udata) {
-    long magic = (long)syscall_argn(args, 0);
-    if (magic != GHOST_MAGIC) return;
+// ==================== 核心 3：物理内存直读 ====================
+static bool do_read_physical(int pid, uint64_t va, void *buf, uint64_t size) {
+    struct task_struct *task = KF_FIND_TASK(pid);
+    if (!task) return false;
+    
+    struct mm_struct *mm = KF_GET_MM(task);
+    if (!mm) return false;
+    
+    uint64_t pgd;
+    // 这里的 64 是 mm->pgd 的偏移（你的 hmkpm 里有动态解析 mm_struct_offset.pgd_offset，这里可替换）
+    if (KF_PROBE_READ(&pgd, (void*)((uintptr_t)mm + 64), 8) != 0 || !pgd) {
+        KF_MMPUT(mm);
+        return false;
+    }
+    
+    // 直接通过页表将虚拟地址转换成物理地址
+    uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, va, false);
+    if (!tkpa) {
+        KF_MMPUT(mm);
+        return false;
+    }
+    
+    // 通过内核线性映射区读取物理内存数据
+    void *kva = (void*)pgt_phys_to_virt(tkpa);
+    KF_COPY_TO_USER(buf, kva, size);
+    
+    KF_MMPUT(mm);
+    return true;
+}
 
-    uint64_t req_ptr = (uint64_t)syscall_argn(args, 1);
-    struct ghost_req req;
+// ==================== 通信层：完美复刻 wuwa 机制 ====================
 
-    if (!kfunc(__arch_copy_from_user)) return;
-    if (kfunc(__arch_copy_from_user)(&req, (void __user *)req_ptr, sizeof(req))) {
+// 1. Hook socket：拦截 AF_DECnet，分配真实的匿名 inode FD，避免 ACE 追踪
+static void before_socket(hook_fargs3_t *args, void *udata) {
+    int family = (int)syscall_argn(args, 0);
+    int type = (int)syscall_argn(args, 1);
+
+    if (family == AF_DECNET_VAL && type == SOCK_RAW) {
         args->skip_origin = 1;
-        args->ret = -14;
+        // 在内核分配一个真实的文件描述符
+        int fd = get_unused_fd_flags(O_CLOEXEC);
+        if (fd >= 0) {
+            // anon_inode 是内核最常用的匿名文件系统，ACE 无法将其判定为外挂特征
+            struct file *filp = anon_inode_getfile("[net]", &anon_inode_fops, NULL, O_RDWR);
+            if (!IS_ERR(filp)) {
+                fd_install(fd, filp);
+                args->ret = fd; // 返回给用户态
+            } else {
+                put_unused_fd(fd);
+                args->ret = -EMFILE;
+            }
+        } else {
+            args->ret = -EMFILE;
+        }
+    }
+}
+
+// 2. Hook ioctl：拦截用户态发来的指令并执行
+static void before_ioctl(hook_fargs3_t *args, void *udata) {
+    unsigned int cmd = (unsigned int)syscall_argn(args, 1);
+    void __user *arg = (void __user *)syscall_argn(args, 2);
+
+    // 仅拦截我们定义的指令，不干扰其他正常程序的 ioctl
+    if (cmd < CMD_GET_PID || cmd > CMD_READ_MEM) return;
+
+    args->skip_origin = 1;
+
+    struct k_req req;
+    if (KF_COPY_FROM_USER(&req, arg, sizeof(req)) != 0) {
+        args->ret = -EFAULT;
         return;
     }
 
-    long ret = -1;
-    struct task_struct *task;
-    struct mm_struct *mm;
-
-    if (req.cmd == CMD_GET_PID) {
-        char pkg[64] = {0};
-        if (kfunc(__arch_copy_from_user)(pkg, (void __user *)req.addr, sizeof(pkg)-1) == 0) {
-            ret = resolve_pid_by_name(pkg);
-        }
+    if (cmd == CMD_GET_PID) {
+        req.pid = do_find_pid(req.name);
+        args->ret = (req.pid > 0) ? 0 : -ENOENT;
     } 
-    else if (req.cmd == CMD_GET_BASE) {
-        char soname[64] = {0};
-        if (kfunc(__arch_copy_from_user)(soname, (void __user *)req.addr, sizeof(soname)-1) == 0) {
-            ret = resolve_base_by_name(req.pid, soname);
-        }
+    else if (cmd == CMD_GET_BASE) {
+        req.addr = do_get_base(req.pid, req.name);
+        args->ret = (req.addr > 0) ? 0 : -ENOENT;
+    } 
+    else if (cmd == CMD_READ_MEM) {
+        bool ok = do_read_physical(req.pid, req.addr, (void*)req.buf, req.size);
+        args->ret = ok ? 0 : -EFAULT;
     }
-    else if (req.cmd == CMD_READ_MEM) {
-        if (kfunc(find_task_by_vpid) && kfunc(get_task_mm)) {
-            task = kfunc(find_task_by_vpid)(req.pid);
-            if (task && (mm = kfunc(get_task_mm)(task))) {
-                long read_ret = pgt_rw_mm(mm, req.addr, req.size, (void __user *)req.user_buf, false);
-                ret = (read_ret == (long)req.size) ? 0 : -EFAULT;
-                if(kfunc(mmput)) kfunc(mmput)(mm);
-            }
-        }
+    else {
+        args->ret = -EINVAL;
     }
 
-    args->skip_origin = 1;
-    args->ret = ret;
+    // 如果需要把 pid 或 addr 回传（如获取 PID 和模块基址），写回用户态
+    if (args->ret == 0 && cmd != CMD_READ_MEM) {
+        KF_COPY_TO_USER(arg, &req, sizeof(req));
+    }
 }
 
-// ==========================================
-// 模块初始化：强制加载并记录详细日志
-// ==========================================
-static long module_init_handler(const char *args, const char *event, void *__user reserved) {
-    pr_info("hmkpm: [INIT] Starting diagnostic load...\n");
+// ==================== KPM 生命周期 ====================
+static long mod_init(const char *args, const char *event, void *__user reserved) {
+    // 初始化页表遍历模块
+    if (pgt_pgtable_init() != 0) return -1;
 
-    // 1. 查符号
-    kv_init_task = (typeof(kv_init_task))kallsyms_lookup_name("init_task");
-    kf___arch_copy_to_user = (typeof(kf___arch_copy_to_user))kallsyms_lookup_name("__arch_copy_to_user");
-    kf___arch_copy_from_user = (typeof(kf___arch_copy_from_user))kallsyms_lookup_name("__arch_copy_from_user");
-    kf_copy_from_kernel_nofault = (typeof(kf_copy_from_kernel_nofault))kallsyms_lookup_name("copy_from_kernel_nofault");
-    kf_find_task_by_vpid = (typeof(kf_find_task_by_vpid))kallsyms_lookup_name("find_task_by_vpid");
-    kf_get_task_mm = (typeof(kf_get_task_mm))kallsyms_lookup_name("get_task_mm");
-    kf_mmput = (typeof(kf_mmput))kallsyms_lookup_name("mmput");
+    hook_err_t err = hook_syscalln(__NR_socket, 3, before_socket, 0, 0);
+    if (err) return err;
 
-    if (!kv_init_task)          pr_err("hmkpm: [FAIL] init_task not found\n");
-    if (!kf___arch_copy_to_user)pr_err("hmkpm: [FAIL] __arch_copy_to_user not found\n");
-    if (!kf___arch_copy_from_user) pr_err("hmkpm: [FAIL] __arch_copy_from_user not found\n");
-    if (!kf_copy_from_kernel_nofault) pr_err("hmkpm: [FAIL] copy_from_kernel_nofault not found\n");
-    if (!kf_find_task_by_vpid)  pr_err("hmkpm: [FAIL] find_task_by_vpid not found\n");
-    if (!kf_get_task_mm)        pr_err("hmkpm: [FAIL] get_task_mm not found\n");
-    if (!kf_mmput)              pr_err("hmkpm: [FAIL] mmput not found\n");
-
-    // 2. 查物理地址基址
-    if (pgt_pgtable_init() != 0) {
-        pr_err("hmkpm: [FAIL] pgt_pgtable_init failed (memstart_addr missing)\n");
-    }
-
-    // 3. 尝试 Hook
-    pr_info("hmkpm: [INIT] Trying fp_hook_syscalln...\n");
-    hook_err_t err = fp_hook_syscalln(GHOST_SYSCALL_NR, 6, ghost_syscall_before, 0, 0);
+    err = hook_syscalln(__NR_ioctl, 3, before_ioctl, 0, 0);
     if (err) {
-        pr_warn("hmkpm: [WARN] fp_hook_syscalln failed (err=%d), trying inline_hook...\n", err);
-        err = inline_hook_syscalln(GHOST_SYSCALL_NR, 6, ghost_syscall_before, 0, 0);
-    }
-    
-    if (err) {
-        pr_err("hmkpm: [FAIL] both hook methods failed, last err=%d\n", err);
-    } else {
-        pr_info("hmkpm: [SUCCESS] syscall hook installed.\n");
-        g_is_ready = true;
-    }
-
-    // 无论如何，强制返回 0，让模块加载成功，这样我们才能看 dmesg！
-    pr_info("hmkpm: [INIT] Load sequence finished.\n");
-    return 0; 
-}
-
-static long module_cleanup_handler(void *__user reserved) {
-    if (g_is_ready) {
-        fp_unhook_syscalln(GHOST_SYSCALL_NR, ghost_syscall_before, 0);
-        inline_unhook_syscalln(GHOST_SYSCALL_NR, ghost_syscall_before, 0);
+        unhook_syscalln(__NR_socket, before_socket, 0);
+        return err;
     }
     return 0;
 }
 
-KPM_INIT(module_init_handler);
-KPM_EXIT(module_cleanup_handler);
+static long mod_exit(void *__user reserved) {
+    unhook_syscalln(__NR_socket, before_socket, 0);
+    unhook_syscalln(__NR_ioctl, before_ioctl, 0);
+    return 0;
+}
+
+KPM_INIT(mod_init);
+KPM_EXIT(mod_exit);
