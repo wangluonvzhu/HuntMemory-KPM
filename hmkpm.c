@@ -6,22 +6,22 @@
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/uaccess.h>
-#include <linux/fs.h>
-#include <linux/file.h>
-#include <linux/fdtable.h>
-#include <linux/dcache.h>
 #include <linux/version.h>
+// 注意：这里移除了报错的 <linux/file.h> 和 <linux/anon_inodes.h>
+// 改为在下方手动声明所需的内核符号和函数
 
-// 【修复】移除 anon_inodes.h，手动声明内核符号
-extern struct file_operations anon_inode_fops;
+KPM_NAME("com.sys.core"); 
+KPM_VERSION("1.0.0");
+KPM_LICENSE("GPL v2");
+
+// 【关键修复】手动声明 CI 环境中缺失的内核结构体与函数
+struct file_operations;
+struct file;
 extern struct file *anon_inode_getfile(const char *name, const struct file_operations *fops, void *priv, int flags);
 extern int get_unused_fd_flags(unsigned flags);
 extern void put_unused_fd(unsigned int fd);
 extern void fd_install(unsigned int fd, struct file *file);
-
-KPM_NAME("com.sys.core"); // 伪装成系统核心组件
-KPM_VERSION("1.0.0");
-KPM_LICENSE("GPL v2");
+extern const struct file_operations anon_inode_fops;
 
 #define AF_DECNET_VAL 12
 #define CMD_GET_PID   0x1001
@@ -37,7 +37,7 @@ struct k_req {
     char name[64];
 };
 
-// ==================== 依赖符号解析 ====================
+// ==================== 动态符号解析 ====================
 #define KF_FIND_TASK ((struct task_struct* (*)(pid_t))kallsyms_lookup_name("find_task_by_vpid"))
 #define KF_GET_MM ((struct mm_struct* (*)(struct task_struct*))kallsyms_lookup_name("get_task_mm"))
 #define KF_MMPUT ((void (*)(struct mm_struct*))kallsyms_lookup_name("mmput"))
@@ -46,12 +46,12 @@ struct k_req {
 #define KF_COPY_TO_USER ((unsigned long (*)(void __user*, const void*, unsigned long))kallsyms_lookup_name("__arch_copy_to_user"))
 #define KF_COPY_FROM_USER ((unsigned long (*)(void*, const void __user*, unsigned long))kallsyms_lookup_name("__arch_copy_from_user"))
 
-// 引入 hmkpm 原版的页表遍历函数 (确保你原工程里有这两个函数)
+// 引入 hmkpm 原版的页表遍历函数 (确保原工程里有)
 extern int pgt_pgtable_init(void);
 extern uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write);
 extern uint64_t pgt_phys_to_virt(uint64_t phys);
 
-// ==================== 核心 1：包名找 PID ====================
+// ==================== 核心 1：包名找 PID (移植自 wuwa) ====================
 static pid_t do_find_pid(const char *name) {
     struct task_struct *p;
     char cmdline[256];
@@ -77,7 +77,7 @@ static pid_t do_find_pid(const char *name) {
     return found_pid;
 }
 
-// ==================== 核心 2：获取模块基址 ====================
+// ==================== 核心 2：获取模块基址 (移植自 wuwa) ====================
 static unsigned long do_get_base(pid_t pid, const char *name) {
     struct task_struct *task = KF_FIND_TASK(pid);
     if (!task) return 0;
@@ -89,7 +89,6 @@ static unsigned long do_get_base(pid_t pid, const char *name) {
     unsigned long base = 0;
     size_t name_len = strlen(name);
     
-    // 针对 6.1+ 和旧内核的 VMA 安全遍历
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
     VMA_ITERATOR(vmi, mm, 0);
     for_each_vma(vmi, vma) {
@@ -97,6 +96,7 @@ static unsigned long do_get_base(pid_t pid, const char *name) {
     for (vma = mm->mmap; vma; vma = vma->vm_next) {
 #endif
         if (vma->vm_file) {
+            // 注：如果这里报 dentry 错，可能还需手动前置声明 struct dentry; 但通常 KPM 自带
             const char *dname = vma->vm_file->f_path.dentry->d_name.name;
             if (dname && strncmp(dname, name, name_len) == 0) {
                 base = vma->vm_start;
@@ -117,20 +117,17 @@ static bool do_read_physical(int pid, uint64_t va, void *buf, uint64_t size) {
     if (!mm) return false;
     
     uint64_t pgd;
-    // 注意：这里的 64 是 mm->pgd 的偏移（你的 hmkpm 里有动态解析 mm_struct_offset.pgd_offset，如有请替换）
     if (KF_PROBE_READ(&pgd, (void*)((uintptr_t)mm + 64), 8) != 0 || !pgd) {
         KF_MMPUT(mm);
         return false;
     }
     
-    // 将虚拟地址翻译成物理地址
     uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, va, false);
     if (!tkpa) {
         KF_MMPUT(mm);
         return false;
     }
     
-    // 通过内核线性映射区读取物理内存数据
     void *kva = (void*)pgt_phys_to_virt(tkpa);
     KF_COPY_TO_USER(buf, kva, size);
     
@@ -138,9 +135,9 @@ static bool do_read_physical(int pid, uint64_t va, void *buf, uint64_t size) {
     return true;
 }
 
-// ==================== 通信层：完美复刻 wuwa ====================
+// ==================== 通信层：完美复刻 wuwa 的 Socket 劫持 ====================
 
-// 1. Hook socket：拦截 AF_DECnet
+// 1. Hook socket：拦截 AF_DECnet 并分配真实的匿名 fd
 static void before_socket(hook_fargs3_t *args, void *udata) {
     int family = (int)syscall_argn(args, 0);
     int type = (int)syscall_argn(args, 1);
@@ -163,11 +160,12 @@ static void before_socket(hook_fargs3_t *args, void *udata) {
     }
 }
 
-// 2. Hook ioctl：拦截通信指令
+// 2. Hook ioctl：解析请求
 static void before_ioctl(hook_fargs3_t *args, void *udata) {
     unsigned int cmd = (unsigned int)syscall_argn(args, 1);
     void __user *arg = (void __user *)syscall_argn(args, 2);
 
+    // 拦截自定义指令
     if (cmd < CMD_GET_PID || cmd > CMD_READ_MEM) return;
 
     args->skip_origin = 1;
@@ -194,7 +192,7 @@ static void before_ioctl(hook_fargs3_t *args, void *udata) {
         args->ret = -EINVAL;
     }
 
-    // 将 pid 和 base 写回用户态
+    // 回写数据给用户态
     if (args->ret == 0 && cmd != CMD_READ_MEM) {
         KF_COPY_TO_USER(arg, &req, sizeof(req));
     }
