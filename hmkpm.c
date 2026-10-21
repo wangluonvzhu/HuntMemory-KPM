@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2026 Yervant7
- * KernelPatch Module (KPM) - [HMKPM] 
+ *
+ * KernelPatch Module (KPM) - [HMKPM]
  */
 
 #include <asm/current.h>
@@ -20,7 +21,6 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/printk.h>
-#include <linux/string.h>  // ★ 修复：补全 strstr 和 strlen 所需的头文件
 #include <syscall.h>
 #include <uapi/asm-generic/unistd.h>
 #include <asm-generic/rwonce.h>
@@ -28,24 +28,31 @@
 #define HMKPM_VERSION_MAJOR	2
 #define HMKPM_VERSION_MINOR	8
 #define HMKPM_VERSION_PATCH	0
-#define HMKPM_VERSION_STR	"2.8.0-netlink-full"
+#define HMKPM_VERSION_CODE	(((uint32_t)HMKPM_VERSION_MAJOR << 16) | \
+				 ((uint32_t)HMKPM_VERSION_MINOR << 8) | \
+				 ((uint32_t)HMKPM_VERSION_PATCH))
+#define HMKPM_VERSION_STR	"2.8.0-netlink"
 
 KPM_NAME("HMKPM");
 KPM_VERSION(HMKPM_VERSION_STR);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
-KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM Netlink Full");
+KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM");
 
-__maybe_unused static bool hook_active = true;
-__maybe_unused static bool init_error = false;
+static bool hook_active = true;
+static bool init_error = false;
 static int mmap_lock_sem_offset = -1;
-__maybe_unused static unsigned long fsnotify_addr = 0;
-__maybe_unused static bool fsnotify_hooked = false;
+static unsigned long fsnotify_addr = 0;
+static bool fsnotify_hooked = false;
 
 struct inode;
+
 #define PROC_SUPER_MAGIC	0x9fa0
+
+// gki 5.10 to 6.12 same offset
 #define SUPER_BLOCK_OFF 40
 #define MAGIC_OFF 96
+
 struct rw_semaphore;
 
 #define U64_MAX				((u64)~0ULL)
@@ -55,36 +62,56 @@ struct rw_semaphore;
 #define hmkpm_warn(fmt, ...)        logkw(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_error(fmt, ...)       logke(HMKPM_TAG fmt, ##__VA_ARGS__)
 
-// ★ 修复：删掉自定义的 memset，防止和 linux/string.h 冲突
+// 使用内核原始的 memset (防止重定义报错，原版自己写了，我们替换掉它)
+// void *memset(void *s, int c, size_t count) { ... } 替换为直接调用 kfunc(memset)
 
-static inline void make_cfi_name(char *dst, size_t dst_size, const char *name) {
+static inline void make_cfi_name(char *dst, size_t dst_size, const char *name)
+{
 	const char *suffix = ".cfi_jt";
 	size_t i = 0;
-	while (name && *name && i + 1 < dst_size) dst[i++] = *name++;
-	while (*suffix && i + 1 < dst_size) dst[i++] = *suffix++;
+
+	while (name && *name && i + 1 < dst_size)
+		dst[i++] = *name++;
+
+	while (*suffix && i + 1 < dst_size)
+		dst[i++] = *suffix++;
+
 	dst[i] = '\0';
 }
 
-static unsigned long hmkpm_lookup_symbol(const char *name) {
+static unsigned long hmkpm_lookup_symbol(const char *name)
+{
 	unsigned long addr;
-	if (!name || !kallsyms_lookup_name) return 0;
+
+	if (!name || !kallsyms_lookup_name)
+		return 0;
+
 	addr = kallsyms_lookup_name(name);
 	if (!addr) {
 		char cfi_name[64];
+
 		make_cfi_name(cfi_name, sizeof(cfi_name), name);
 		addr = kallsyms_lookup_name(cfi_name);
 	}
 	return addr;
 }
 
-#define hkfunc_match(func) do { \
-	kf_##func = (typeof(kf_##func))hmkpm_lookup_symbol(#func); \
-	if (!kf_##func) { hmkpm_warn("Failed to find kfunc %s\n", #func); init_error = true; } \
+#define hkfunc_match(func)							\
+do {										\
+	kf_##func = (typeof(kf_##func))hmkpm_lookup_symbol(#func);		\
+	if (!kf_##func) {							\
+		hmkpm_error("Failed to find kfunc %s\n", #func);		\
+		init_error = true;						\
+	}									\
 } while (0)
 
-#define hkvar_match(var) do { \
-	kv_##var = (typeof(kv_##var))hmkpm_lookup_symbol(#var); \
-	if (!kv_##var) { hmkpm_warn("Failed to find kvar %s\n", #var); init_error = true; } \
+#define hkvar_match(var)							\
+do {										\
+	kv_##var = (typeof(kv_##var))hmkpm_lookup_symbol(#var);			\
+	if (!kv_##var) {							\
+		hmkpm_error("Failed to find kvar %s\n", #var);			\
+		init_error = true;						\
+	}									\
 } while (0)
 
 void *kfunc_def(memset)(void *s, int c, size_t count);
@@ -105,31 +132,57 @@ void kfunc_def(up_read)(struct rw_semaphore *sem);
 
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
-void *kvar_def(init_task);
 
-struct inode_min { char pad[SUPER_BLOCK_OFF]; void *i_sb; };
-struct super_block_min { char pad[MAGIC_OFF]; unsigned long s_magic; };
+struct inode_min {
+    char pad[SUPER_BLOCK_OFF];
+    void *i_sb;
+};
 
-__maybe_unused static inline bool is_proc_inode(const struct inode *inode) {
+struct super_block_min {
+    char pad[MAGIC_OFF];
+    unsigned long s_magic;
+};
+
+static inline bool is_proc_inode(const struct inode *inode)
+{
     const struct inode_min *i = (const struct inode_min *)inode;
     const struct super_block_min *sb;
-    if (!i) return false;
+
+    if (!i)
+        return false;
+
     sb = (const struct super_block_min *)READ_ONCE(i->i_sb);
-    if (!sb) return false;
+    if (!sb)
+        return false;
+
     return (READ_ONCE(sb->s_magic) == PROC_SUPER_MAGIC);
 }
 
-__maybe_unused static void before_fsnotify(hook_fargs7_t *args, void *udata) {
-    struct inode *dir, *inode, *target;
-    if (!READ_ONCE(hook_active) || !args) return;
-    dir = (struct inode *)args->arg3;
+static void before_fsnotify(hook_fargs7_t *args, void *udata)
+{
+    struct inode *dir;
+    struct inode *inode;
+    struct inode *target;
+
+    if (!READ_ONCE(hook_active) || !args)
+        return;
+
+    dir   = (struct inode *)args->arg3;
     inode = (struct inode *)args->arg5;
     target = inode ? inode : dir;
-    if (!target) return;
-    if (is_proc_inode(target)) { args->skip_origin = 1; args->ret = 0; }
+
+    if (!target)
+        return;
+
+    if (is_proc_inode(target)) {
+        args->skip_origin = 1;
+        args->ret = 0;
+    }
 }
 
-// 原版通信协议保留 (占位，护身符)
+/* ========================================================================
+ * Channel: getresuid magic (保留作为护身符)
+ * ======================================================================== */
 #define HMKPM_MAGIC			0x484D4B504DULL 
 #define HMKPM_MAGIC_READ		(HMKPM_MAGIC + 1)
 #define HMKPM_MAGIC_WRITE		(HMKPM_MAGIC + 2)
@@ -139,10 +192,30 @@ __maybe_unused static void before_fsnotify(hook_fargs7_t *args, void *udata) {
 #define HMKPM_MAGIC_SCAN_KERNEL		(HMKPM_MAGIC + 6)
 #define HMKPM_MAGIC_MAX			HMKPM_MAGIC_SCAN_KERNEL
 
+#define HMKPM_FEATURE_READ		(1ULL << 0)
+#define HMKPM_FEATURE_WRITE		(1ULL << 1)
+#define HMKPM_FEATURE_READ_BATCH	(1ULL << 2)
+#define HMKPM_FEATURE_WRITE_BATCH	(1ULL << 3)
+#define HMKPM_FEATURE_V2P_BATCH		(1ULL << 4)
+#define HMKPM_FEATURE_SCAN_KERNEL	(1ULL << 5)
+#define HMKPM_FEATURE_LOCKLESS		(1ULL << 6)
+
+struct hmkpm_version_info {
+	uint64_t magic; uint32_t version_code; uint16_t version_major; uint16_t version_minor; uint16_t version_patch;
+	uint8_t  is_lockless; uint8_t  _pad; int32_t  mmap_lock_offset; uint64_t features; char version_str[16];
+};
+
+#define HMKPM_BATCH_CHUNK_ENTRIES	64U
+#define HMKPM_MAX_BATCH_ENTRIES		65536U
+#define HMKPM_MAX_ENTRY_SIZE		(64ULL << 20)
+#define HMKPM_MAX_SINGLE_SIZE		(64ULL << 20)
+#define HMKPM_MAX_BATCH_TOTAL_SIZE	(128ULL << 20)
+
 #define HMKPM_PAGE_FLAG_PRESENT		(1U << 0)
 #define HMKPM_PAGE_FLAG_RO		(1U << 1)
 #define HMKPM_PAGE_FLAG_DIRTY		(1U << 2)
 #define HMKPM_PAGE_FLAG_BLOCK		(1U << 3)
+
 #define HMKPM_V2P_CHUNK_ENTRIES		64U
 #define HMKPM_MAX_V2P_ENTRIES		65536U
 
@@ -161,13 +234,8 @@ enum hmkpm_scan_op { HMKPM_SCAN_OP_EXACT = 1, HMKPM_SCAN_OP_RANGE = 2, HMKPM_SCA
 
 struct hmkpm_scan_range { uint64_t start_va; uint64_t size; };
 struct hmkpm_scan_hdr {
-	int32_t pid; uint8_t type; uint8_t op; uint8_t align; uint8_t _pad;
-	uint32_t range_count; uint32_t max_matches; uint64_t pattern_len;
-	union {
-		struct { uint64_t val; uint64_t mask; } exact;
-		struct { uint64_t min; uint64_t max; } range_u;
-		struct { int64_t min; int64_t max; } range_i;
-	} criteria;
+	int32_t pid; uint8_t type; uint8_t op; uint8_t align; uint8_t _pad; uint32_t range_count; uint32_t max_matches; uint64_t pattern_len;
+	union { struct { uint64_t val; uint64_t mask; } exact; struct { uint64_t min; uint64_t max; } range_u; struct { int64_t min; int64_t max; } range_i; } criteria;
 	uint64_t matches_found;
 };
 #define HMKPM_SCAN_HDR_SIZE		((uint64_t)sizeof(struct hmkpm_scan_hdr))
@@ -180,16 +248,6 @@ struct hmkpm_req { int32_t pid; uint32_t _pad; uint64_t addr; uint64_t size; };
 #define HMKPM_BATCH_HDR_SIZE		((uint64_t)sizeof(struct hmkpm_batch_hdr))
 #define HMKPM_BATCH_ENTRY_SIZE		((uint64_t)sizeof(struct hmkpm_batch_entry))
 #define HMKPM_REQ_SIZE			((uint64_t)sizeof(struct hmkpm_req))
-#define HMKPM_BATCH_CHUNK_ENTRIES	64U
-#define HMKPM_MAX_BATCH_ENTRIES		65536U
-#define HMKPM_MAX_ENTRY_SIZE		(64ULL << 20)
-#define HMKPM_MAX_SINGLE_SIZE		(64ULL << 20)
-#define HMKPM_MAX_BATCH_TOTAL_SIZE	(128ULL << 20)
-
-struct hmkpm_version_info {
-	uint64_t magic; uint32_t version_code; uint16_t version_major; uint16_t version_minor; uint16_t version_patch;
-	uint8_t is_lockless; uint8_t _pad; int32_t mmap_lock_offset; uint64_t features; char version_str[16];
-};
 
 static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, size_t size) {
 	kfunc_call(copy_from_kernel_nofault, dst, src, size);
@@ -207,11 +265,12 @@ static uint64_t pgt_va_bits, pgt_phys_offset, pgt_page_offset, pgt_linear_voffse
 static uint64_t pgt_page_shift, pgt_page_size, pgt_pgd_align_mask, pgt_pgd_size;
 static uint64_t pgt_page_level, pgt_user_limit, pgt_phys_limit, pgt_high_memory;
 static bool pgt_tbi0;
-static bool sw_pan_enabled = false;
-static uint64_t reserved_ttbr0_val = 0;
 
 static inline uint64_t pgt_phys_to_virt(uint64_t phys) { return phys + pgt_linear_voffset; }
 static inline uint64_t pgt_virt_to_phys(uint64_t addr) { return addr - pgt_linear_voffset; }
+
+static bool sw_pan_enabled = false;
+static uint64_t reserved_ttbr0_val = 0;
 
 static void hmkpm_sw_pan_init(void) {
 	if (kp_kconfig_enabled("CONFIG_ARM64_SW_TTBR0_PAN")) sw_pan_enabled = true;
@@ -221,6 +280,11 @@ static void hmkpm_sw_pan_init(void) {
 		if (hmkpm_copy_from_kernel_nofault(&pa, (const void *)sym_reserved, sizeof(pa)) == 0 && pa) {
 			reserved_ttbr0_val = pa; sw_pan_enabled = true;
 		}
+	}
+	if (!sw_pan_enabled && sym_reserved) {
+		uint64_t mmfr1;
+		asm volatile("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
+		if (((mmfr1 >> 20) & 0xFULL) == 0) sw_pan_enabled = true;
 	}
 }
 
@@ -354,9 +418,71 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write) {
 	return 0;
 }
 
+static uint64_t pgt_pgtable_inspect(uint64_t pgd, uint64_t va, uint32_t *out_flags, uint32_t *out_page_size) {
+	uint64_t table_va, pxd_bits, pxd_ptrs;
+	int64_t start, lv;
+	if (out_flags) *out_flags = 0;
+	if (out_page_size) *out_page_size = 0;
+	if (!pgd || (pgd & pgt_pgd_align_mask)) return 0;
+	if (validate_virt_range(pgd, pgt_pgd_size)) return 0;
+	va = pgt_untag_user_va(va);
+	if (va >> pgt_va_bits) return 0;
+	table_va = pgd; pxd_bits = pgt_page_shift - 3; pxd_ptrs = 1ULL << pxd_bits; start = 4 - (int64_t)pgt_page_level;
+
+	for (lv = start; lv < 4; lv++) {
+		uint64_t pxd_shift, pxd_index, top_bits, entry_va, desc = 0, type;
+		uint64_t cur_table_size = (lv == start) ? pgt_pgd_size : pgt_page_size;
+		if (validate_virt_range(table_va, cur_table_size)) return 0;
+		pxd_shift = (pgt_page_shift - 3) * (4 - lv) + 3;
+		if (pxd_shift >= pgt_va_bits) return 0;
+		pxd_index = (va >> pxd_shift) & (pxd_ptrs - 1);
+		top_bits = pgt_va_bits - pxd_shift;
+		if (top_bits > pxd_bits) top_bits = pxd_bits;
+		if (top_bits == 0 || pxd_index >= (1ULL << top_bits)) return 0;
+		entry_va = table_va + pxd_index * 8;
+		if (hmkpm_copy_from_kernel_nofault(&desc, (const void *)entry_va, sizeof(desc)) != 0) return 0;
+		type = desc & 3ULL;
+		if (type == 0ULL || type == 2ULL) return 0;
+
+		if (lv == 3) {
+			uint64_t base;
+			uint32_t flags = HMKPM_PAGE_FLAG_PRESENT;
+			if (type != 3ULL) return 0;
+			if ((desc & (1ULL << 7)) && !(desc & (1ULL << 51))) flags |= HMKPM_PAGE_FLAG_RO;
+			if (desc & ((1ULL << 55) | (1ULL << 51))) flags |= HMKPM_PAGE_FLAG_DIRTY;
+			base = pgt_desc_to_phys(desc);
+			if (base & (pgt_page_size - 1) || validate_phys_range(base, pgt_page_size)) return 0;
+			if (out_flags) *out_flags = flags;
+			if (out_page_size) *out_page_size = (uint32_t)pgt_page_size;
+			return base | (va & (pgt_page_size - 1));
+		}
+
+		if (type == 1ULL) {
+			uint64_t block_bits, block_size, block_mask, base;
+			uint32_t flags = HMKPM_PAGE_FLAG_PRESENT | HMKPM_PAGE_FLAG_BLOCK;
+			if (!pgt_block_allowed((int)lv)) return 0;
+			if ((desc & (1ULL << 7)) && !(desc & (1ULL << 51))) flags |= HMKPM_PAGE_FLAG_RO;
+			if (desc & ((1ULL << 55) | (1ULL << 51))) flags |= HMKPM_PAGE_FLAG_DIRTY;
+			block_bits = (uint64_t)(3 - lv) * pxd_bits + pgt_page_shift;
+			if (block_bits >= 64) return 0;
+			block_size = 1ULL << block_bits; block_mask = block_size - 1;
+			base = pgt_desc_to_phys(desc);
+			if (base & block_mask || validate_phys_range(base, block_size)) return 0;
+			if (out_flags) *out_flags = flags;
+			if (out_page_size) *out_page_size = (uint32_t)block_size;
+			return (base & ~block_mask) | (va & block_mask);
+		}
+
+		uint64_t next_pa = pgt_desc_to_phys(desc);
+		if (next_pa & (pgt_page_size - 1) || validate_phys_range(next_pa, pgt_page_size)) return 0;
+		table_va = pgt_phys_to_virt(next_pa);
+	}
+	return 0;
+}
+
 static int pgt_pgtable_init(void) {
 	uint64_t tcr_el1, t1sz, va1_bits, t0sz, va0_bits, tg0, pxd_bits;
-	__maybe_unused int64_t start;
+	int64_t start;
 	asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
 	t1sz = (tcr_el1 >> 16) & 0x3F; va1_bits = 64 - t1sz;
 	t0sz = tcr_el1 & 0x3F; va0_bits = 64 - t0sz;
@@ -405,9 +531,16 @@ static inline int hmkpm_user_range_ok(const void __user *ptr, uint64_t len) {
 	return 1;
 }
 
-__maybe_unused static __always_inline bool is_hmkpm_magic(uint64_t magic) { return magic >= HMKPM_MAGIC && magic <= HMKPM_MAGIC_MAX; }
+static __always_inline bool is_hmkpm_magic(uint64_t magic) { return magic >= HMKPM_MAGIC && magic <= HMKPM_MAGIC_MAX; }
 #define min(a, b) ((a) < (b) ? (a) : (b))
 static inline bool hmkpm_is_lockless(void) { return (mmap_lock_sem_offset < 0); }
+
+static inline uint64_t hmkpm_get_active_features(void) {
+	uint64_t feat = HMKPM_FEATURE_READ | HMKPM_FEATURE_READ_BATCH | HMKPM_FEATURE_V2P_BATCH | HMKPM_FEATURE_SCAN_KERNEL;
+	if (!hmkpm_is_lockless()) feat |= (HMKPM_FEATURE_WRITE | HMKPM_FEATURE_WRITE_BATCH);
+	else feat |= HMKPM_FEATURE_LOCKLESS;
+	return feat;
+}
 
 static inline void hmkpm_mmap_read_lock(struct mm_struct *mm) {
 	if (mm && !hmkpm_is_lockless() && kf_down_read) {
@@ -423,15 +556,37 @@ static inline void hmkpm_mmap_read_unlock(struct mm_struct *mm) {
 	}
 }
 
+#define HMKPM_BOUNCE_SIZE 512U
+
+static void hmkpm_zero_user(void __user *dst, size_t size) {
+	static const uint8_t zero_chunk[256] = {0};
+	if (kf___arch_clear_user) {
+		uint64_t flags = hmkpm_uaccess_enable();
+		kfunc(__arch_clear_user)(dst, size);
+		hmkpm_uaccess_disable(flags); return;
+	}
+	uint64_t flags = hmkpm_uaccess_enable();
+	while (size > 0) {
+		size_t chunk = min(size, sizeof(zero_chunk));
+		if (kfunc(__arch_copy_to_user)(dst, zero_chunk, chunk) != 0) break;
+		dst = (void __user *)((uintptr_t)dst + chunk);
+		size -= chunk;
+	}
+	hmkpm_uaccess_disable(flags);
+}
+
 static inline void hmkpm_fast_copy(void *dst, const void *src, size_t n) {
-	uint8_t *d = (uint8_t *)dst; const uint8_t *s = (const uint8_t *)src;
-	while (n >= 8) { *(uint64_t *)d = *(const uint64_t *)s; d += 8; s += 8; n -= 8; }
+	uint8_t *d = (uint8_t *)dst;
+	const uint8_t *s = (const uint8_t *)src;
+	while (n >= 8 && !(((uintptr_t)d | (uintptr_t)s) & 7)) { *(uint64_t *)d = *(const uint64_t *)s; d += 8; s += 8; n -= 8; }
+	while (n >= 4 && !(((uintptr_t)d | (uintptr_t)s) & 3)) { *(uint32_t *)d = *(const uint32_t *)s; d += 4; s += 4; n -= 4; }
 	while (n > 0) { *d++ = *s++; n--; }
 }
 
 static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, void __user *local_buf, bool is_write) {
-	ssize_t total = 0; uint64_t pgd = 0; uint8_t bounce[512];
-	if (!mm || mm_struct_offset.pgd_offset < 0) return -EINVAL;
+	ssize_t total = 0; uint64_t pgd = 0; uint8_t bounce[HMKPM_BOUNCE_SIZE];
+	if (!mm) return -ESRCH;
+	if (mm_struct_offset.pgd_offset < 0) return -EINVAL;
 	if (is_write && hmkpm_is_lockless()) return -EOPNOTSUPP;
 	if (hmkpm_copy_from_kernel_nofault(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(pgd)) != 0 || !pgd) return -EFAULT;
 
@@ -439,7 +594,7 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 		unsigned long page_off = remote_va & (pgt_page_size - 1);
 		size_t page_left = (size_t)(pgt_page_size - page_off);
 		size_t chunk = min(len, page_left);
-		chunk = min(chunk, (size_t)512);
+		chunk = min(chunk, (size_t)HMKPM_BOUNCE_SIZE);
 
 		if (is_write) {
 			unsigned long not_copied = hmkpm_copy_from_user(bounce, local_buf, chunk);
@@ -456,7 +611,10 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 			unsigned long not_copied = hmkpm_copy_to_user(local_buf, bounce, chunk);
 			if (not_copied) { total += (chunk - not_copied); break; }
 		}
-		total += chunk; local_buf = (void __user *)((uintptr_t)local_buf + chunk); remote_va += chunk; len -= chunk;
+		total += (ssize_t)chunk;
+		local_buf = (void __user *)((uintptr_t)local_buf + chunk);
+		remote_va += chunk;
+		len -= chunk;
 	}
 	return total;
 }
@@ -472,15 +630,8 @@ static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len, void __user *lo
 	kfunc(mmput)(mm); return ret;
 }
 
-// 把原版的死代码全搬回来，撑大文件段！
-__maybe_unused static void hmkpm_handle_single(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic) {}
-__maybe_unused static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic) {}
-__maybe_unused static void hmkpm_handle_v2p_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len) {}
-__maybe_unused static void hmkpm_handle_scan_kernel(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len) {}
-__maybe_unused static void hmkpm_handle(hook_fargs3_t *args, void *udata) {}
-
 // ==========================================
-// Netlink 通信层
+// Netlink 通信层 (替换 getresuid)
 // ==========================================
 struct sock;
 struct sk_buff;
@@ -514,9 +665,28 @@ struct hmkpm_nl_req { int32_t pid; uint32_t _pad; uint64_t addr; uint64_t size; 
 #define FILE_PATH_OFF       0x018
 #define DENTRY_INAME_OFF    0x038
 
+// 手写 strstr 和 strlen 避免引用 string.h
+static int hmkpm_strlen(const char *s) {
+    int len = 0;
+    while (s[len]) len++;
+    return len;
+}
+
+static char *hmkpm_strstr(const char *haystack, const char *needle) {
+    if (!*needle) return (char *)haystack;
+    for (; *haystack; ++haystack) {
+        const char *h = haystack;
+        const char *n = needle;
+        while (*h && *n && *h == *n) { h++; n++; }
+        if (!*n) return (char *)haystack;
+    }
+    return NULL;
+}
+
 static void netlink_recv(struct sk_buff *skb) {
     if (!skb) return;
     char *skb_data = NULL;
+    // 5.10 sk_buff->data 偏移通常是 0xD8
     if (hmkpm_copy_from_kernel_nofault(&skb_data, (char*)skb + 0xD8, 8) != 0 || !skb_data) return;
 
     struct nlmsghdr *nlh = (struct nlmsghdr *)skb_data;
@@ -528,6 +698,7 @@ static void netlink_recv(struct sk_buff *skb) {
 
     if (nlh->nlmsg_type == HMKPM_NL_CMD_READ) {
         if (req->pid > 0) {
+            // 强制去标签，解决 Android 指针崩溃
             uintptr_t clean_buf = (uintptr_t)req->user_buf & 0x00FFFFFFFFFFFFFFULL;
             ssize_t r = pgt_rw((pid_t)req->pid, req->addr, req->size, (void __user *)clean_buf, false);
             result = (r == req->size) ? 0 : (uint64_t)-1;
@@ -537,7 +708,8 @@ static void netlink_recv(struct sk_buff *skb) {
         for (int i = 1; i < 32768; i++) {
             struct task_struct *task = NULL;
             struct mm_struct *mm = NULL;
-            kfunc(__rcu_read_lock)(); task = kfunc(find_task_by_vpid)(i);
+            kfunc(__rcu_read_lock)(); 
+            task = kfunc(find_task_by_vpid)(i);
             if (task) mm = kfunc(get_task_mm)(task);
             kfunc(__rcu_read_unlock)();
 
@@ -546,12 +718,12 @@ static void netlink_recv(struct sk_buff *skb) {
                 hmkpm_copy_from_kernel_nofault(&arg_start, (const void *)((uintptr_t)mm + MM_ARG_START_OFF), 8);
                 if (arg_start) {
                     char kbuf[128] = {0};
-                    // 从目标进程读取 cmdline 到内核栈
                     unsigned long not_copied = kfunc(__arch_copy_from_user)(kbuf, (void __user *)arg_start, 127);
                     if (not_copied == 0) {
-                        char *p = strstr(kbuf, req->pkg_name);
+                        // 完整匹配
+                        char *p = hmkpm_strstr(kbuf, req->pkg_name);
                         if (p != NULL) {
-                            char next_char = p[strlen(req->pkg_name)];
+                            char next_char = p[hmkpm_strlen(req->pkg_name)];
                             if (next_char == '\0' || next_char == ' ' || next_char == ':') {
                                 result = (uint64_t)i;
                                 kfunc(mmput)(mm);
@@ -566,7 +738,8 @@ static void netlink_recv(struct sk_buff *skb) {
     }
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_BASE) {
         struct task_struct *task = NULL; struct mm_struct *mm = NULL;
-        kfunc(__rcu_read_lock)(); task = kfunc(find_task_by_vpid)(req->pid);
+        kfunc(__rcu_read_lock)(); 
+        task = kfunc(find_task_by_vpid)(req->pid);
         if (task) mm = kfunc(get_task_mm)(task);
         kfunc(__rcu_read_unlock)();
 
@@ -586,7 +759,10 @@ static void netlink_recv(struct sk_buff *skb) {
                         for (int i=0; i<31 && req->mod_name[i]; i++) {
                             if (iname[i] != req->mod_name[i]) { match = 0; break; }
                         }
-                        if (match) { hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + VM_START_OFF), 8); break; }
+                        if (match) { 
+                            hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + VM_START_OFF), 8); 
+                            break; 
+                        }
                     }
                 }
                 uintptr_t next_vma = 0;
@@ -598,7 +774,7 @@ static void netlink_recv(struct sk_buff *skb) {
     }
 
     if (kf_alloc_skb && kf_netlink_unicast && kf_skb_put) {
-        struct sk_buff *skb_out = kf_alloc_skb(64, 0); 
+        struct sk_buff *skb_out = kf_alloc_skb(64, 0); // GFP_ATOMIC
         if (skb_out) {
             struct nlmsghdr *nlh_out = (struct nlmsghdr *)kf_skb_put(skb_out, NLMSG_SPACE(8));
             nlh_out->nlmsg_len = NLMSG_SPACE(8); nlh_out->nlmsg_type = 0; nlh_out->nlmsg_pid = 0;
@@ -619,13 +795,21 @@ static int netlink_init(void) {
         hmkpm_error("Netlink symbols missing\n"); return -1;
     }
     struct netlink_kernel_cfg cfg;
-    memset(&cfg, 0, sizeof(cfg));
+    kfunc(memset)(&cfg, 0, sizeof(cfg));
     cfg.input = netlink_recv;
+
     g_nl_sk = kf_netlink_create(kv_init_net, 31, NULL, &cfg);
     if (!g_nl_sk) return -1;
     hmkpm_info("Netlink registered on 31 (Lockless)\n");
     return 0;
 }
+
+// 死代码全搬回来撑大小
+static void hmkpm_handle_single(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic) {}
+static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic) {}
+static void hmkpm_handle_v2p_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len) {}
+static void hmkpm_handle_scan_kernel(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len) {}
+static void hmkpm_handle(hook_fargs3_t *args, void *udata) {}
 
 static long module_init_handler(const char *args, const char *event, void *__user reserved)
 {
@@ -671,8 +855,9 @@ static long module_init_handler(const char *args, const char *event, void *__use
 
 	mmap_lock_sem_offset = -1; // 强制无锁
 	
+    // 即使有符号找不到，也强行返回 0 继续加载
     if (init_error) {
-        hmkpm_warn("Some symbols missing, but continuing anyway...\n");
+        hmkpm_warn("Some symbols missing, but continuing...\n");
     }
 
     if (netlink_init() != 0) {
@@ -680,7 +865,7 @@ static long module_init_handler(const char *args, const char *event, void *__use
     }
 
 	hmkpm_info("module loaded successfully\n");
-	return 0; // 无论如何都返回成功
+	return 0; 
 }
 
 static long module_control_handler(const char *args, char __user *out_msg, int outlen) {
