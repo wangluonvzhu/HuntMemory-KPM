@@ -488,7 +488,7 @@ static void hmkpm_handle_scan_kernel(hook_fargs3_t *args, void __user *user_ptr,
 static void hmkpm_handle(hook_fargs3_t *args, void *udata) {}
 
 // ==========================================
-// Netlink 通信层 (替换 getresuid)
+// Netlink 通信层
 // ==========================================
 struct sock;
 struct sk_buff;
@@ -512,7 +512,6 @@ static struct sock *g_nl_sk = NULL;
 
 struct hmkpm_nl_req { int32_t pid; uint32_t _pad; uint64_t addr; uint64_t size; uint64_t user_buf; char pkg_name[64]; char mod_name[64]; };
 
-// ★ 核心改动区：添加了手写字符串匹配，避开了头文件依赖
 static int hmkpm_strlen(const char *s) { int len = 0; while (s[len]) len++; return len; }
 static int hmkpm_strstr(const char *haystack, const char *needle) {
     if (!*needle) return 1;
@@ -527,11 +526,9 @@ static int hmkpm_strstr(const char *haystack, const char *needle) {
 static void netlink_recv(struct sk_buff *skb) {
     if (!skb) return;
     
-    // ★ 1. 看看有没有收到消息
     hmkpm_info("=== netlink_recv triggered! ===\n");
 
     char *skb_data = NULL;
-    // 如果这里报错，说明 sk_buff 的 0xD8 偏移不对
     if (hmkpm_copy_from_kernel_nofault(&skb_data, (char*)skb + 0xD8, 8) != 0 || !skb_data) {
         hmkpm_error("Failed to read skb_data at 0xD8!\n");
         return;
@@ -544,7 +541,6 @@ static void netlink_recv(struct sk_buff *skb) {
     uint32_t user_pid = nlh->nlmsg_pid;
     uint64_t result = 0;
 
-    // ★ 2. 看看收到的命令是什么
     hmkpm_info("Received cmd: 0x%X\n", nlh->nlmsg_type);
 
     if (nlh->nlmsg_type == HMKPM_NL_CMD_READ) {
@@ -556,6 +552,11 @@ static void netlink_recv(struct sk_buff *skb) {
     } 
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_PID) {
         hmkpm_info("Start GET_PID, searching: %s\n", req->pkg_name);
+        
+        // ★ 针对 5.10 内核优化：加入多偏移探测，并且读取 511 字节
+        uint64_t try_offsets[] = {0x2B0, 0x2A8, 0x2C0, 0x2B8, 0x2D0};
+        int num_offsets = sizeof(try_offsets) / sizeof(try_offsets[0]);
+
         for (int i = 1; i < 32768; i++) {
             struct task_struct *task = NULL;
             struct mm_struct *mm = NULL;
@@ -565,25 +566,32 @@ static void netlink_recv(struct sk_buff *skb) {
             kfunc(__rcu_read_unlock)();
 
             if (mm) {
-                uint64_t arg_start = 0;
-                // ★ 3. 验证 0x2B0 偏移是否能读出有效地址
-                hmkpm_copy_from_kernel_nofault(&arg_start, (const void *)((uintptr_t)mm + 0x2B0), 8);
-                if (arg_start) {
-                    char kbuf[128] = {0};
-                    if (pgt_rw(i, arg_start, 127, (void __user *)kbuf, false) > 0) {
-                        // ★ 4. 把读到的字符串打印出来看看！
-                        // 如果这里刷屏的全是乱码，说明 0x2B0 彻底错了
-                        hmkpm_info("PID %d argv: %s\n", i, kbuf);
-                        
-                        if (hmkpm_strstr(kbuf, req->pkg_name)) {
-                            hmkpm_info("!!! Found target PID: %d !!!\n", i);
-                            result = (uint64_t)i;
-                            kfunc(mmput)(mm);
-                            break;
+                bool found = false;
+                
+                for (int k = 0; k < num_offsets; k++) {
+                    uint64_t arg_start = 0;
+                    hmkpm_copy_from_kernel_nofault(&arg_start, (const void *)((uintptr_t)mm + try_offsets[k]), 8);
+                    
+                    if (arg_start && arg_start > 0x1000 && arg_start < 0x7FFFFFFFFFFF) {
+                        // ★ 加大到 511 字节，把后面的包名读出来
+                        char kbuf[512] = {0};
+                        if (pgt_rw(i, arg_start, 511, (void __user *)kbuf, false) > 0) {
+                            
+                            // 这一行会疯狂刷屏，因为会遍历所有进程。如果你想知道到底读了啥，可以取消注释
+                            // hmkpm_info("Try 0x%llx -> PID %d argv: %s\n", try_offsets[k], i, kbuf);
+                            
+                            if (hmkpm_strstr(kbuf, req->pkg_name)) {
+                                hmkpm_info("!!! Found target PID: %d at offset 0x%llx !!!\n", i, try_offsets[k]);
+                                result = (uint64_t)i;
+                                found = true;
+                                break;
+                            }
                         }
                     }
                 }
+                
                 kfunc(mmput)(mm);
+                if (found) break;
             }
         }
     }
@@ -599,24 +607,24 @@ static void netlink_recv(struct sk_buff *skb) {
             uintptr_t vma = 0;
             hmkpm_copy_from_kernel_nofault(&vma, (const void *)((uintptr_t)mm + 0x000), 8);
             
-            // ★ 5. 验证 mm+0x000 是否读到了 vma 链表头
             hmkpm_info("First VMA addr: 0x%lX\n", vma);
 
             int count = 0;
-            while (vma && count < 500) { // 加个限制防止死循环
+            while (vma && count < 1000) { // 稍微限制一下防止死循环
                 count++;
                 uintptr_t file = 0;
-                hmkpm_copy_from_kernel_nofault(&file, (const void *)(vma + 0x0A0), 8); // vm_file
+                // ★ 小米 5.10 内核 vm_file 通常是 0xA0 或 0xB0
+                hmkpm_copy_from_kernel_nofault(&file, (const void *)(vma + 0xA0), 8); 
                 if (file) {
                     uintptr_t dentry = 0;
-                    hmkpm_copy_from_kernel_nofault(&dentry, (const void *)(file + 0x018 + 8), 8); // dentry
+                    // ★ file->f_path.dentry，通常是 0x18 或 0x20
+                    hmkpm_copy_from_kernel_nofault(&dentry, (const void *)(file + 0x18), 8); 
                     if (dentry) {
-                        char iname[32] = {0};
-                        hmkpm_copy_from_kernel_nofault(iname, (const void *)(dentry + 0x038), 31); // d_iname
+                        char iname[64] = {0};
+                        hmkpm_copy_from_kernel_nofault(iname, (const void *)(dentry + 0x38), 63); // d_iname
                         
-                        // ★ 6. 打印遍历到的 .so 名字
-                        // 如果找不到 libunity.so 或者打印乱码，说明 0xA0 或 0x38 错了
                         if (iname[0] != '\0') {
+                            // 你可以看这里打印的模块名有没有乱码，如果有，说明偏移还是错的
                             hmkpm_info("VMA[%d] name: %s\n", count, iname);
                         }
 
@@ -635,7 +643,6 @@ static void netlink_recv(struct sk_buff *skb) {
         }
     }
 
-    // ★ 7. 打印最终返回给用户端的结果
     hmkpm_info("Result: 0x%lX\n", result);
 
     if (kf_alloc_skb && kf_netlink_unicast && kf_skb_put) {
