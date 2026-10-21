@@ -21,6 +21,8 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/printk.h>
+#include <linux/dcache.h>      // 新增：为了识别 vma->vm_file 里的 dentry
+#include <linux/fs.h>          // 新增：为了识别 file 结构体
 #include <syscall.h>
 #include <uapi/asm-generic/unistd.h>
 #include <asm-generic/rwonce.h>
@@ -134,65 +136,6 @@ static void before_fsnotify(hook_fargs7_t *args, void *udata) {
     if (!target) return;
     if (is_proc_inode(target)) { args->skip_origin = 1; args->ret = 0; }
 }
-
-// ============================================================
-// 保留原版协议宏和结构体 (占位护身符)
-// ============================================================
-#define HMKPM_MAGIC			0x484D4B504DULL 
-#define HMKPM_MAGIC_READ		(HMKPM_MAGIC + 1)
-#define HMKPM_MAGIC_WRITE		(HMKPM_MAGIC + 2)
-#define HMKPM_MAGIC_READ_BATCH		(HMKPM_MAGIC + 3)
-#define HMKPM_MAGIC_WRITE_BATCH		(HMKPM_MAGIC + 4)
-#define HMKPM_MAGIC_V2P_BATCH		(HMKPM_MAGIC + 5)
-#define HMKPM_MAGIC_SCAN_KERNEL		(HMKPM_MAGIC + 6)
-#define HMKPM_MAGIC_MAX			HMKPM_MAGIC_SCAN_KERNEL
-
-#define HMKPM_PAGE_FLAG_PRESENT		(1U << 0)
-#define HMKPM_PAGE_FLAG_RO		(1U << 1)
-#define HMKPM_PAGE_FLAG_DIRTY		(1U << 2)
-#define HMKPM_PAGE_FLAG_BLOCK		(1U << 3)
-#define HMKPM_V2P_CHUNK_ENTRIES		64U
-#define HMKPM_MAX_V2P_ENTRIES		65536U
-
-struct hmkpm_v2p_hdr { int32_t pid; uint32_t _pad; uint64_t count; };
-struct hmkpm_v2p_entry { uint64_t va; uint64_t pa; uint32_t flags; uint32_t page_size; };
-#define HMKPM_V2P_HDR_SIZE		((uint64_t)sizeof(struct hmkpm_v2p_hdr))
-#define HMKPM_V2P_ENTRY_SIZE		((uint64_t)sizeof(struct hmkpm_v2p_entry))
-
-enum hmkpm_scan_type { HMKPM_SCAN_TYPE_I8 = 1, HMKPM_SCAN_TYPE_U8 = 2, HMKPM_SCAN_TYPE_I16 = 3, HMKPM_SCAN_TYPE_U16 = 4, HMKPM_SCAN_TYPE_I32 = 5, HMKPM_SCAN_TYPE_U32 = 6, HMKPM_SCAN_TYPE_I64 = 7, HMKPM_SCAN_TYPE_U64 = 8, HMKPM_SCAN_TYPE_F32 = 9, HMKPM_SCAN_TYPE_F64 = 10, HMKPM_SCAN_TYPE_BYTES = 11 };
-enum hmkpm_scan_op { HMKPM_SCAN_OP_EXACT = 1, HMKPM_SCAN_OP_RANGE = 2, HMKPM_SCAN_OP_MASK = 3 };
-
-#define HMKPM_MAX_SCAN_RANGES		4096U
-#define HMKPM_MAX_PATTERN_LEN		256U
-#define HMKPM_MAX_SCAN_MATCHES		1048576U
-#define HMKPM_SCAN_MATCH_CHUNK		64U
-
-struct hmkpm_scan_range { uint64_t start_va; uint64_t size; };
-struct hmkpm_scan_hdr {
-	int32_t pid; uint8_t type; uint8_t op; uint8_t align; uint8_t _pad; uint32_t range_count; uint32_t max_matches; uint64_t pattern_len;
-	union { struct { uint64_t val; uint64_t mask; } exact; struct { uint64_t min; uint64_t max; } range_u; struct { int64_t min; int64_t max; } range_i; } criteria;
-	uint64_t matches_found;
-};
-#define HMKPM_SCAN_HDR_SIZE		((uint64_t)sizeof(struct hmkpm_scan_hdr))
-#define HMKPM_SCAN_RANGE_SIZE		((uint64_t)sizeof(struct hmkpm_scan_range))
-
-struct hmkpm_batch_hdr { int32_t pid; uint32_t _pad; uint64_t count; uint64_t data_total; };
-struct hmkpm_batch_entry { uint64_t addr; uint64_t size; };
-struct hmkpm_req { int32_t pid; uint32_t _pad; uint64_t addr; uint64_t size; };
-
-#define HMKPM_BATCH_HDR_SIZE		((uint64_t)sizeof(struct hmkpm_batch_hdr))
-#define HMKPM_BATCH_ENTRY_SIZE		((uint64_t)sizeof(struct hmkpm_batch_entry))
-#define HMKPM_REQ_SIZE			((uint64_t)sizeof(struct hmkpm_req))
-#define HMKPM_BATCH_CHUNK_ENTRIES	64U
-#define HMKPM_MAX_BATCH_ENTRIES		65536U
-#define HMKPM_MAX_ENTRY_SIZE		(64ULL << 20)
-#define HMKPM_MAX_SINGLE_SIZE		(64ULL << 20)
-#define HMKPM_MAX_BATCH_TOTAL_SIZE	(128ULL << 20)
-
-struct hmkpm_version_info {
-	uint64_t magic; uint32_t version_code; uint16_t version_major; uint16_t version_minor; uint16_t version_patch;
-	uint8_t is_lockless; uint8_t _pad; int32_t mmap_lock_offset; uint64_t features; char version_str[16];
-};
 
 static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, size_t size) {
 	kfunc_call(copy_from_kernel_nofault, dst, src, size);
@@ -413,7 +356,6 @@ static inline int hmkpm_user_range_ok(const void __user *ptr, uint64_t len) {
 	return 1;
 }
 
-static __always_inline bool is_hmkpm_magic(uint64_t magic) { return magic >= HMKPM_MAGIC && magic <= HMKPM_MAGIC_MAX; }
 #define min(a, b) ((a) < (b) ? (a) : (b))
 static inline bool hmkpm_is_lockless(void) { return (mmap_lock_sem_offset < 0); }
 
@@ -480,14 +422,8 @@ static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len, void __user *lo
 	kfunc(mmput)(mm); return ret;
 }
 
-static void hmkpm_handle_single(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic) {}
-static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic) {}
-static void hmkpm_handle_v2p_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len) {}
-static void hmkpm_handle_scan_kernel(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len) {}
-static void hmkpm_handle(hook_fargs3_t *args, void *udata) {}
-
 // ==========================================
-// Netlink 通信层
+// Netlink 通信层 (替换 getresuid)
 // ==========================================
 struct sock;
 struct sk_buff;
@@ -511,7 +447,6 @@ static struct sock *g_nl_sk = NULL;
 
 struct hmkpm_nl_req { int32_t pid; uint32_t _pad; uint64_t addr; uint64_t size; uint64_t user_buf; char pkg_name[64]; char mod_name[64]; };
 
-static int hmkpm_strlen(const char *s) { int len = 0; while (s[len]) len++; return len; }
 static int hmkpm_strstr(const char *haystack, const char *needle) {
     if (!*needle) return 1;
     for (; *haystack; ++haystack) {
@@ -524,23 +459,15 @@ static int hmkpm_strstr(const char *haystack, const char *needle) {
 
 static void netlink_recv(struct sk_buff *skb) {
     if (!skb) return;
-    
-    hmkpm_info("=== netlink_recv triggered! ===\n");
-
     char *skb_data = NULL;
-    if (hmkpm_copy_from_kernel_nofault(&skb_data, (char*)skb + 0xD8, 8) != 0 || !skb_data) {
-        hmkpm_error("Failed to read skb_data at 0xD8!\n");
-        return;
-    }
-    
+    if (hmkpm_copy_from_kernel_nofault(&skb_data, (char*)skb + 0xD8, 8) != 0 || !skb_data) return;
+
     struct nlmsghdr *nlh = (struct nlmsghdr *)skb_data;
     if (nlh->nlmsg_len < sizeof(struct hmkpm_nl_req)) return;
 
     struct hmkpm_nl_req *req = (struct hmkpm_nl_req *)NLMSG_DATA(nlh);
     uint32_t user_pid = nlh->nlmsg_pid;
     uint64_t result = 0;
-
-    hmkpm_info("Received cmd: 0x%X\n", nlh->nlmsg_type);
 
     if (nlh->nlmsg_type == HMKPM_NL_CMD_READ) {
         if (req->pid > 0) {
@@ -550,143 +477,52 @@ static void netlink_recv(struct sk_buff *skb) {
         }
     } 
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_PID) {
-        hmkpm_info("Start GET_PID via init_task task list, target: %s\n", req->pkg_name);
-        
-        unsigned long init_task_addr = hmkpm_lookup_symbol("init_task");
-        if (!init_task_addr) {
-            hmkpm_error("init_task symbol not found!\n");
-        } else {
-            // 小米 5.10 task_struct->tasks 偏移通常是 0x550 或 0x558
-            uint64_t tasks_offsets[] = {0x550, 0x558, 0x548, 0x540};
-            // task_struct->comm 偏移通常是 0x730 或 0x738
-            uint64_t comm_offsets[] = {0x730, 0x738, 0x728, 0x740, 0x720};
-            
-            int num_tasks = sizeof(tasks_offsets) / sizeof(tasks_offsets[0]);
-            int num_comm = sizeof(comm_offsets) / sizeof(comm_offsets[0]);
+        for (int i = 1; i < 32768; i++) {
+            struct task_struct *task = NULL;
+            struct mm_struct *mm = NULL;
+            kfunc(__rcu_read_lock)(); 
+            task = kfunc(find_task_by_vpid)(i);
+            if (task) mm = kfunc(get_task_mm)(task);
+            kfunc(__rcu_read_unlock)();
 
-            for (int t_idx = 0; t_idx < num_tasks; t_idx++) {
-                uint64_t tasks_off = tasks_offsets[t_idx];
-                uintptr_t list_head = init_task_addr + tasks_off;
-                uintptr_t current_node = 0;
-                hmkpm_copy_from_kernel_nofault(&current_node, (const void *)(list_head), 8); // 读 init_task->tasks.next
-
-                int loop_guard = 0;
-                while (current_node != list_head && loop_guard++ < 10000) {
-                    // 通过 next 指针反推 task_struct 的基地址
-                    uintptr_t task_addr = current_node - tasks_off;
-                    
-                    for (int c_idx = 0; c_idx < num_comm; c_idx++) {
-                        char kcomm[17] = {0};
-                        hmkpm_copy_from_kernel_nofault(kcomm, (const void *)(task_addr + comm_offsets[c_idx]), 16);
-                        
-                        if (kcomm[0] != '\0') {
-                            if (hmkpm_strstr(kcomm, "tmgp")) { 
-                                // 如果 comm 匹配，尝试找 pid（通常在 0x5d8）
-                                int kpid = 0;
-                                hmkpm_copy_from_kernel_nofault(&kpid, (const void *)(task_addr + 0x5d8), 4);
-                                if (kpid == 0) { // 再试几个常用 pid 偏移
-                                    hmkpm_copy_from_kernel_nofault(&kpid, (const void *)(task_addr + 0x5b8), 4);
-                                }
-                                if (kpid > 0) {
-                                    hmkpm_info("!!! Found target PID: %d (comm: %s) via task_list_off 0x%llx !!!\n", kpid, kcomm, tasks_off);
-                                    result = (uint64_t)kpid;
-                                    goto found_pid;
-                                }
-                            }
-                        }
+            if (mm) {
+                // ★ 终极修正：直接通过结构体指针访问 arg_start，彻底抛弃偏移量
+                char kbuf[128] = {0};
+                if (pgt_rw(i, (uint64_t)mm->arg_start, 127, (void __user *)kbuf, false) > 0) {
+                    if (hmkpm_strstr(kbuf, req->pkg_name)) {
+                        result = (uint64_t)i;
+                        kfunc(mmput)(mm);
+                        break;
                     }
-                    // 读取 next 指针
-                    uintptr_t next_node = 0;
-                    hmkpm_copy_from_kernel_nofault(&next_node, (const void *)(current_node), 8);
-                    current_node = next_node;
                 }
+                kfunc(mmput)(mm);
             }
         }
-        found_pid:;
     }
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_BASE) {
-        hmkpm_info("Start GET_BASE for PID: %d, mod: %s\n", req->pid, req->mod_name);
-        // 这里用 find_task_by_vpid 可能依然拿不到 mm，所以也加上遍历
         struct task_struct *task = NULL; struct mm_struct *mm = NULL;
-        
-        // 先用 find_task_by_vpid 试一下，如果返回 null，就用链表找
         kfunc(__rcu_read_lock)(); 
         task = kfunc(find_task_by_vpid)(req->pid);
         if (task) mm = kfunc(get_task_mm)(task);
         kfunc(__rcu_read_unlock)();
 
-        if (!mm) {
-            // 尝试通过 task list 找 mm
-            unsigned long init_task_addr = hmkpm_lookup_symbol("init_task");
-            if (init_task_addr) {
-                uint64_t tasks_offsets[] = {0x550, 0x558, 0x548, 0x540};
-                int num_tasks = sizeof(tasks_offsets) / sizeof(tasks_offsets[0]);
-
-                for (int t_idx = 0; t_idx < num_tasks; t_idx++) {
-                    uint64_t tasks_off = tasks_offsets[t_idx];
-                    uintptr_t list_head = init_task_addr + tasks_off;
-                    uintptr_t current_node = 0;
-                    hmkpm_copy_from_kernel_nofault(&current_node, (const void *)(list_head), 8);
-
-                    int loop_guard = 0;
-                    while (current_node != list_head && loop_guard++ < 10000) {
-                        uintptr_t task_addr = current_node - tasks_off;
-                        int kpid = 0;
-                        hmkpm_copy_from_kernel_nofault(&kpid, (const void *)(task_addr + 0x5d8), 4);
-                        if (kpid == 0) hmkpm_copy_from_kernel_nofault(&kpid, (const void *)(task_addr + 0x5b8), 4);
-                        
-                        if (kpid == req->pid) {
-                            // 读 mm 指针，偏移通常是 0x540 或 0x548
-                            hmkpm_copy_from_kernel_nofault(&mm, (const void *)(task_addr + 0x540), 8);
-                            if (!mm) hmkpm_copy_from_kernel_nofault(&mm, (const void *)(task_addr + 0x548), 8);
-                            if (mm) {
-                                // 不需要 mmput，因为我们在内核里直接拿到了引用
-                                break;
-                            }
-                        }
-                        uintptr_t next_node = 0;
-                        hmkpm_copy_from_kernel_nofault(&next_node, (const void *)(current_node), 8);
-                        current_node = next_node;
-                    }
-                    if (mm) break;
-                }
-            }
-        }
-
         if (mm) {
-            uintptr_t vma = 0;
-            hmkpm_copy_from_kernel_nofault(&vma, (const void *)((uintptr_t)mm + 0x000), 8);
-            
-            hmkpm_info("First VMA addr: 0x%lX\n", vma);
-
-            int count = 0;
-            while (vma && count < 2000) {
-                count++;
-                uintptr_t file = 0;
-                hmkpm_copy_from_kernel_nofault(&file, (const void *)(vma + 0xA0), 8); 
+            // ★ 终极修正：直接遍历原生链表，无需计算偏移
+            struct vm_area_struct *vma = mm->mmap;
+            while (vma) {
+                struct file *file = vma->vm_file;
                 if (file) {
-                    uintptr_t dentry = 0;
-                    hmkpm_copy_from_kernel_nofault(&dentry, (const void *)(file + 0x18), 8); 
-                    if (dentry) {
-                        char iname[64] = {0};
-                        hmkpm_copy_from_kernel_nofault(iname, (const void *)(dentry + 0x38), 63);
-                        
-                        if (hmkpm_strstr(iname, req->mod_name)) { 
-                            hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + 0x000), 8);
-                            hmkpm_info("!!! Found %s: 0x%lX !!!\n", req->mod_name, result);
-                            break; 
-                        }
+                    const char *name = file->f_path.dentry->d_iname;
+                    if (name && hmkpm_strstr(name, req->mod_name)) {
+                        result = (uint64_t)vma->vm_start;
+                        break;
                     }
                 }
-                uintptr_t next_vma = 0;
-                hmkpm_copy_from_kernel_nofault(&next_vma, (const void *)(vma + 0x008), 8);
-                vma = next_vma;
+                vma = vma->vm_next;
             }
-            if (task) kfunc(mmput)(mm);
+            kfunc(mmput)(mm);
         }
     }
-
-    hmkpm_info("Result: 0x%lX\n", result);
 
     if (kf_alloc_skb && kf_netlink_unicast && kf_skb_put) {
         struct sk_buff *skb_out = kf_alloc_skb(64, 0); 
@@ -769,6 +605,22 @@ static long module_init_handler(const char *args, const char *event, void *__use
 
     if (netlink_init() != 0) return -ENOENT;
 
+    // 防检测：拦截 fsnotify (如果内核符号存在，则挂钩)
+    if (kver >= VERSION(5, 10, 0)) {
+		fsnotify_addr = hmkpm_lookup_symbol("fsnotify");
+		if (fsnotify_addr) {
+			hook_err_t err = hook_wrap7((void *)fsnotify_addr, before_fsnotify, 0, 0);
+			if (err) {
+				hmkpm_error("hook installation of fsnotify failed: %d\n", err);
+				fsnotify_hooked = false;
+			} else {
+				fsnotify_hooked = true;
+			}
+		} else {
+			hmkpm_info("fsnotify_addr not found, skipping fsnotify hook\n");
+		}
+	}
+
 	hmkpm_info("module loaded successfully\n");
 	return 0; 
 }
@@ -779,6 +631,13 @@ static long module_control_handler(const char *args, char __user *out_msg, int o
 }
 
 static long module_cleanup_handler(void *__user reserved) {
+    // 卸载防检测 hook
+    if (fsnotify_hooked && fsnotify_addr) {
+		hook_unwrap((void *)fsnotify_addr, before_fsnotify, 0);
+		fsnotify_hooked = false;
+	}
+
+    // 卸载 Netlink 通信
     if (g_nl_sk && hmkpm_lookup_symbol("netlink_kernel_release")) {
         void (*release_nl)(struct sock*) = (void*)hmkpm_lookup_symbol("netlink_kernel_release");
         release_nl(g_nl_sk);
