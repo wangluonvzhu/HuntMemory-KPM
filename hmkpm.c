@@ -27,16 +27,13 @@
 #define HMKPM_VERSION_MAJOR	2
 #define HMKPM_VERSION_MINOR	8
 #define HMKPM_VERSION_PATCH	0
-#define HMKPM_VERSION_CODE	(((uint32_t)HMKPM_VERSION_MAJOR << 16) | \
-				 ((uint32_t)HMKPM_VERSION_MINOR << 8) | \
-				 ((uint32_t)HMKPM_VERSION_PATCH))
-#define HMKPM_VERSION_STR	"2.8.0-netlink-keep"
+#define HMKPM_VERSION_STR	"2.8.0-netlink-full"
 
 KPM_NAME("HMKPM");
 KPM_VERSION(HMKPM_VERSION_STR);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
-KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM");
+KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM Netlink Full");
 
 static bool hook_active = true;
 static bool init_error = false;
@@ -135,7 +132,7 @@ static void before_fsnotify(hook_fargs7_t *args, void *udata) {
     if (is_proc_inode(target)) { args->skip_origin = 1; args->ret = 0; }
 }
 
-// 原版通信协议保留
+// 原版通信协议保留 (护身符)
 #define HMKPM_MAGIC			0x484D4B504DULL 
 #define HMKPM_MAGIC_READ		(HMKPM_MAGIC + 1)
 #define HMKPM_MAGIC_WRITE		(HMKPM_MAGIC + 2)
@@ -534,7 +531,8 @@ static void netlink_recv(struct sk_buff *skb) {
 
     if (nlh->nlmsg_type == HMKPM_NL_CMD_READ) {
         if (req->pid > 0) {
-            ssize_t r = pgt_rw((pid_t)req->pid, req->addr, req->size, (void __user *)(uintptr_t)req->user_buf, false);
+            uintptr_t clean_buf = (uintptr_t)req->user_buf & 0x00FFFFFFFFFFFFFFULL;
+            ssize_t r = pgt_rw((pid_t)req->pid, req->addr, req->size, (void __user *)clean_buf, false);
             result = (r == req->size) ? 0 : (uint64_t)-1;
         }
     } 
@@ -542,21 +540,27 @@ static void netlink_recv(struct sk_buff *skb) {
         for (int i = 1; i < 32768; i++) {
             struct task_struct *task = NULL;
             struct mm_struct *mm = NULL;
-            kfunc(__rcu_read_lock)();
-            task = kfunc(find_task_by_vpid)(i);
+            kfunc(__rcu_read_lock)(); task = kfunc(find_task_by_vpid)(i);
             if (task) mm = kfunc(get_task_mm)(task);
             kfunc(__rcu_read_unlock)();
+
             if (mm) {
                 uintptr_t arg_start = 0;
                 hmkpm_copy_from_kernel_nofault(&arg_start, (const void *)((uintptr_t)mm + MM_ARG_START_OFF), 8);
                 if (arg_start) {
-                    char cmdline[128] = {0};
-                    if (pgt_rw(i, arg_start, 127, (void __user *)cmdline, false) > 0) {
-                        int match = 1;
-                        for (int j=0; j<63 && req->pkg_name[j]; j++) {
-                            if (cmdline[j] != req->pkg_name[j]) { match = 0; break; }
+                    char kbuf[128] = {0};
+                    // 关键：从目标进程读取 cmdline 到内核栈
+                    unsigned long not_copied = kfunc(__arch_copy_from_user)(kbuf, (void __user *)arg_start, 127);
+                    if (not_copied == 0) {
+                        char *p = strstr(kbuf, req->pkg_name);
+                        if (p != NULL) {
+                            char next_char = p[strlen(req->pkg_name)];
+                            if (next_char == '\0' || next_char == ' ' || next_char == ':') {
+                                result = (uint64_t)i;
+                                kfunc(mmput)(mm);
+                                break;
+                            }
                         }
-                        if (match) { result = (uint64_t)i; kfunc(mmput)(mm); break; }
                     }
                 }
                 kfunc(mmput)(mm);
@@ -564,12 +568,11 @@ static void netlink_recv(struct sk_buff *skb) {
         }
     }
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_BASE) {
-        struct task_struct *task = NULL;
-        struct mm_struct *mm = NULL;
-        kfunc(__rcu_read_lock)();
-        task = kfunc(find_task_by_vpid)(req->pid);
+        struct task_struct *task = NULL; struct mm_struct *mm = NULL;
+        kfunc(__rcu_read_lock)(); task = kfunc(find_task_by_vpid)(req->pid);
         if (task) mm = kfunc(get_task_mm)(task);
         kfunc(__rcu_read_unlock)();
+
         if (mm) {
             uintptr_t vma = 0;
             hmkpm_copy_from_kernel_nofault(&vma, (const void *)((uintptr_t)mm + MM_MMAP_OFF), 8);
