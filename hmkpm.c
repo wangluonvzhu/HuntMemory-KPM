@@ -20,7 +20,7 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/printk.h>
-#include <linux/string.h>  // ★ 修复：补充 strstr 和 strlen 所需的头文件
+#include <linux/string.h>  // ★ 修复：补全 strstr 和 strlen 所需的头文件
 #include <syscall.h>
 #include <uapi/asm-generic/unistd.h>
 #include <asm-generic/rwonce.h>
@@ -36,11 +36,11 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM Netlink Full");
 
-static bool hook_active = true;
-static bool init_error = false;
+__maybe_unused static bool hook_active = true;
+__maybe_unused static bool init_error = false;
 static int mmap_lock_sem_offset = -1;
-static unsigned long fsnotify_addr = 0;
-static bool fsnotify_hooked = false;
+__maybe_unused static unsigned long fsnotify_addr = 0;
+__maybe_unused static bool fsnotify_hooked = false;
 
 struct inode;
 #define PROC_SUPER_MAGIC	0x9fa0
@@ -55,11 +55,7 @@ struct rw_semaphore;
 #define hmkpm_warn(fmt, ...)        logkw(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_error(fmt, ...)       logke(HMKPM_TAG fmt, ##__VA_ARGS__)
 
-void *memset(void *s, int c, size_t count) {
-    unsigned char *p = (unsigned char *)s;
-    while (count--) *p++ = (unsigned char)c;
-    return s;
-}
+// ★ 修复：删掉自定义的 memset，防止和 linux/string.h 冲突
 
 static inline void make_cfi_name(char *dst, size_t dst_size, const char *name) {
 	const char *suffix = ".cfi_jt";
@@ -114,7 +110,7 @@ void *kvar_def(init_task);
 struct inode_min { char pad[SUPER_BLOCK_OFF]; void *i_sb; };
 struct super_block_min { char pad[MAGIC_OFF]; unsigned long s_magic; };
 
-static inline bool is_proc_inode(const struct inode *inode) {
+__maybe_unused static inline bool is_proc_inode(const struct inode *inode) {
     const struct inode_min *i = (const struct inode_min *)inode;
     const struct super_block_min *sb;
     if (!i) return false;
@@ -360,7 +356,7 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write) {
 
 static int pgt_pgtable_init(void) {
 	uint64_t tcr_el1, t1sz, va1_bits, t0sz, va0_bits, tg0, pxd_bits;
-	int64_t start;
+	__maybe_unused int64_t start;
 	asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
 	t1sz = (tcr_el1 >> 16) & 0x3F; va1_bits = 64 - t1sz;
 	t0sz = tcr_el1 & 0x3F; va0_bits = 64 - t0sz;
@@ -409,7 +405,7 @@ static inline int hmkpm_user_range_ok(const void __user *ptr, uint64_t len) {
 	return 1;
 }
 
-static __always_inline bool is_hmkpm_magic(uint64_t magic) { return magic >= HMKPM_MAGIC && magic <= HMKPM_MAGIC_MAX; }
+__maybe_unused static __always_inline bool is_hmkpm_magic(uint64_t magic) { return magic >= HMKPM_MAGIC && magic <= HMKPM_MAGIC_MAX; }
 #define min(a, b) ((a) < (b) ? (a) : (b))
 static inline bool hmkpm_is_lockless(void) { return (mmap_lock_sem_offset < 0); }
 
@@ -675,12 +671,10 @@ static long module_init_handler(const char *args, const char *event, void *__use
 
 	mmap_lock_sem_offset = -1; // 强制无锁
 	
-    // 终极宽容：即使 init_error 为 true 也强行继续
     if (init_error) {
         hmkpm_warn("Some symbols missing, but continuing anyway...\n");
     }
 
-    // 终极宽容：即使 netlink 注册失败也强行继续
     if (netlink_init() != 0) {
         hmkpm_error("Netlink init failed, but continuing...\n");
     }
@@ -698,4 +692,11 @@ static long module_cleanup_handler(void *__user reserved) {
     if (g_nl_sk && hmkpm_lookup_symbol("netlink_kernel_release")) {
         void (*release_nl)(struct sock*) = (void*)hmkpm_lookup_symbol("netlink_kernel_release");
         release_nl(g_nl_sk);
-    
+    }
+	hmkpm_info("module cleaned up\n");
+	return 0;
+}
+
+KPM_INIT(module_init_handler);
+KPM_CTL0(module_control_handler);
+KPM_EXIT(module_cleanup_handler);
