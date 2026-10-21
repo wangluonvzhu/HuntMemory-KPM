@@ -20,6 +20,7 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/printk.h>
+#include <linux/string.h>  // ★ 修复：补充 strstr 和 strlen 所需的头文件
 #include <syscall.h>
 #include <uapi/asm-generic/unistd.h>
 #include <asm-generic/rwonce.h>
@@ -122,7 +123,7 @@ static inline bool is_proc_inode(const struct inode *inode) {
     return (READ_ONCE(sb->s_magic) == PROC_SUPER_MAGIC);
 }
 
-static void before_fsnotify(hook_fargs7_t *args, void *udata) {
+__maybe_unused static void before_fsnotify(hook_fargs7_t *args, void *udata) {
     struct inode *dir, *inode, *target;
     if (!READ_ONCE(hook_active) || !args) return;
     dir = (struct inode *)args->arg3;
@@ -476,11 +477,11 @@ static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len, void __user *lo
 }
 
 // 把原版的死代码全搬回来，撑大文件段！
-static void hmkpm_handle_single(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic) {}
-static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic) {}
-static void hmkpm_handle_v2p_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len) {}
-static void hmkpm_handle_scan_kernel(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len) {}
-static void hmkpm_handle(hook_fargs3_t *args, void *udata) {}
+__maybe_unused static void hmkpm_handle_single(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic) {}
+__maybe_unused static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic) {}
+__maybe_unused static void hmkpm_handle_v2p_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len) {}
+__maybe_unused static void hmkpm_handle_scan_kernel(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len) {}
+__maybe_unused static void hmkpm_handle(hook_fargs3_t *args, void *udata) {}
 
 // ==========================================
 // Netlink 通信层
@@ -549,7 +550,7 @@ static void netlink_recv(struct sk_buff *skb) {
                 hmkpm_copy_from_kernel_nofault(&arg_start, (const void *)((uintptr_t)mm + MM_ARG_START_OFF), 8);
                 if (arg_start) {
                     char kbuf[128] = {0};
-                    // 关键：从目标进程读取 cmdline 到内核栈
+                    // 从目标进程读取 cmdline 到内核栈
                     unsigned long not_copied = kfunc(__arch_copy_from_user)(kbuf, (void __user *)arg_start, 127);
                     if (not_copied == 0) {
                         char *p = strstr(kbuf, req->pkg_name);
@@ -697,11 +698,4 @@ static long module_cleanup_handler(void *__user reserved) {
     if (g_nl_sk && hmkpm_lookup_symbol("netlink_kernel_release")) {
         void (*release_nl)(struct sock*) = (void*)hmkpm_lookup_symbol("netlink_kernel_release");
         release_nl(g_nl_sk);
-    }
-	hmkpm_info("module cleaned up\n");
-	return 0;
-}
-
-KPM_INIT(module_init_handler);
-KPM_CTL0(module_control_handler);
-KPM_EXIT(module_cleanup_handler
+    
