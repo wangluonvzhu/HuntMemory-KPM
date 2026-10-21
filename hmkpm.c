@@ -39,20 +39,6 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM");
 
-// 声明 init_task 以支持 for_each_process
-extern struct task_struct init_task;
-#ifndef list_entry
-#define list_entry(ptr, type, member) \
-    ((type *)((char *)(ptr) - (unsigned long)(&((type *)0)->member)))
-#endif
-#ifndef list_first_entry
-#define list_first_entry(ptr, type, member) \
-    list_entry((ptr)->next, type, member)
-#endif
-// 内核原生宏：遍历所有进程
-#define for_each_process(p) \
-    for (p = &init_task ; (p = list_entry((p)->tasks.next, struct task_struct, tasks)) != &init_task ; )
-
 static bool hook_active = true;
 static bool init_error = false;
 static int mmap_lock_sem_offset = -1;
@@ -564,84 +550,72 @@ static void netlink_recv(struct sk_buff *skb) {
         }
     } 
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_PID) {
-        hmkpm_info("Kernel GET_PID: searching comm for: %s\n", req->pkg_name);
-        
-        // 截取包名的前几位用于 comm 匹配，例如 "com.tencent.tmgp.cod" -> "tmgp.cod"
-        char match_str[32] = {0};
-        const char *dot = req->pkg_name;
-        // 尝试提取最后一段和中间的关键字
-        while ((dot = hmkpm_strstr(dot, "."))) {
-            dot++;
-            if (hmkpm_strlen(dot) > 5) {
-                strncpy(match_str, dot, 15); // comm 最多 16 字节
-            }
-        }
-        if (match_str[0] == '\0') {
-            strncpy(match_str, req->pkg_name, 15); // 兜底
-        }
-        
-        hmkpm_info("Match comm string: %s\n", match_str);
+        hmkpm_info("Start GET_PID via vpid loop, target: %s\n", req->pkg_name);
+        uint64_t comm_offsets[] = {0x730, 0x738, 0x728, 0x740, 0x720};
+        int num_offsets = sizeof(comm_offsets) / sizeof(comm_offsets[0]);
 
-        struct task_struct *p;
-        // 使用 for_each_process 平滑遍历所有进程，不会触发暴力检索的保护机制
-        for_each_process(p) {
-            char kcomm[17] = {0};
-            // 5.10 内核 task_struct->comm 偏移通常是 0x730
-            hmkpm_copy_from_kernel_nofault(kcomm, (const void *)((uintptr_t)p + 0x730), 16);
-            
-            if (kcomm[0] != '\0' && hmkpm_strstr(kcomm, match_str)) {
-                // 5.10 task_struct->pid 偏移通常是 0x5d8
-                int kpid = 0;
-                hmkpm_copy_from_kernel_nofault(&kpid, (const void *)((uintptr_t)p + 0x5d8), 4);
-                
-                if (kpid > 0) {
-                    hmkpm_info("!!! Found PID: %d, comm: %s !!!\n", kpid, kcomm);
-                    result = (uint64_t)kpid;
-                    break;
+        for (int i = 1; i < 32768; i++) {
+            struct task_struct *task = NULL;
+            kfunc(__rcu_read_lock)();
+            task = kfunc(find_task_by_vpid)(i);
+            kfunc(__rcu_read_unlock)();
+
+            if (task) {
+                for (int k = 0; k < num_offsets; k++) {
+                    char kcomm[17] = {0};
+                    hmkpm_copy_from_kernel_nofault(kcomm, (const void *)((uintptr_t)task + comm_offsets[k]), 16);
+                    if (kcomm[0] != '\0') {
+                        // 打印出来看看，如果全是乱码或者空，说明偏移都错了
+                        // hmkpm_info("PID %d off 0x%llx: %s\n", i, comm_offsets[k], kcomm);
+                        if (hmkpm_strstr(kcomm, "tmgp")) { 
+                            hmkpm_info("!!! Found target PID: %d (comm: %s) via offset 0x%llx !!!\n", i, kcomm, comm_offsets[k]);
+                            result = (uint64_t)i;
+                            goto found_pid;
+                        }
+                    }
                 }
             }
         }
+        found_pid:;
     }
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_BASE) {
         hmkpm_info("Start GET_BASE for PID: %d, mod: %s\n", req->pid, req->mod_name);
-        
-        struct task_struct *p;
-        for_each_process(p) {
-            int kpid = 0;
-            hmkpm_copy_from_kernel_nofault(&kpid, (const void *)((uintptr_t)p + 0x5d8), 4);
+        struct task_struct *task = NULL; struct mm_struct *mm = NULL;
+        kfunc(__rcu_read_lock)(); 
+        task = kfunc(find_task_by_vpid)(req->pid);
+        if (task) mm = kfunc(get_task_mm)(task);
+        kfunc(__rcu_read_unlock)();
+
+        if (mm) {
+            uintptr_t vma = 0;
+            hmkpm_copy_from_kernel_nofault(&vma, (const void *)((uintptr_t)mm + 0x000), 8);
             
-            if (kpid == req->pid) {
-                struct mm_struct *mm = NULL;
-                // 5.10 task_struct->mm 偏移通常是 0x540
-                hmkpm_copy_from_kernel_nofault(&mm, (const void *)((uintptr_t)p + 0x540), 8);
-                
-                if (mm) {
-                    uintptr_t vma = 0;
-                    hmkpm_copy_from_kernel_nofault(&vma, (const void *)((uintptr_t)mm + 0x000), 8);
-                    
-                    int count = 0;
-                    while (vma && count++ < 2000) {
-                        uintptr_t file = 0;
-                        hmkpm_copy_from_kernel_nofault(&file, (const void *)(vma + 0xA0), 8);
-                        if (file) {
-                            uintptr_t dentry = 0;
-                            hmkpm_copy_from_kernel_nofault(&dentry, (const void *)(file + 0x18), 8);
-                            if (dentry) {
-                                char iname[64] = {0};
-                                hmkpm_copy_from_kernel_nofault(iname, (const void *)(dentry + 0x38), 63);
-                                
-                                if (hmkpm_strstr(iname, req->mod_name)) { 
-                                    hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + 0x000), 8);
-                                    hmkpm_info("!!! Found %s: 0x%lX !!!\n", req->mod_name, result);
-                                    break; 
-                                }
-                            }
+            hmkpm_info("First VMA addr: 0x%lX\n", vma);
+
+            int count = 0;
+            while (vma && count < 2000) {
+                count++;
+                uintptr_t file = 0;
+                hmkpm_copy_from_kernel_nofault(&file, (const void *)(vma + 0xA0), 8); 
+                if (file) {
+                    uintptr_t dentry = 0;
+                    hmkpm_copy_from_kernel_nofault(&dentry, (const void *)(file + 0x18), 8); 
+                    if (dentry) {
+                        char iname[64] = {0};
+                        hmkpm_copy_from_kernel_nofault(iname, (const void *)(dentry + 0x38), 63);
+                        
+                        if (hmkpm_strstr(iname, req->mod_name)) { 
+                            hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + 0x000), 8);
+                            hmkpm_info("!!! Found %s: 0x%lX !!!\n", req->mod_name, result);
+                            break; 
                         }
-                        hmkpm_copy_from_kernel_nofault(&vma, (const void *)(vma + 0x008), 8);
                     }
                 }
-                break;
+                uintptr_t next_vma = 0;
+                hmkpm_copy_from_kernel_nofault(&next_vma, (const void *)(vma + 0x008), 8);
+                vma = next_vma;
             }
+            kfunc(mmput)(mm);
         }
     }
 
