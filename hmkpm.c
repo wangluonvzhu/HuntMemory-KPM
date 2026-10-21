@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (c) 2026 Yervant7
+ * KernelPatch Module (KPM) - [HMKPM] Netlink Full
+ */
+
 #include <asm/current.h>
 #include <common.h>
 #include <compiler.h>
@@ -19,40 +24,60 @@
 #include <uapi/asm-generic/unistd.h>
 #include <asm-generic/rwonce.h>
 
-#define HMKPM_VERSION_STR	"3.0.0-netlink-pure"
+#define HMKPM_VERSION_MAJOR	2
+#define HMKPM_VERSION_MINOR	8
+#define HMKPM_VERSION_PATCH	0
+#define HMKPM_VERSION_STR	"2.8.0-netlink-full"
 
 KPM_NAME("HMKPM");
 KPM_VERSION(HMKPM_VERSION_STR);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
-KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM Netlink Pure");
+KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM Netlink Full");
 
+static bool hook_active = true;
+static bool init_error = false;
+static int mmap_lock_sem_offset = -1;
+static unsigned long fsnotify_addr = 0;
+static bool fsnotify_hooked = false;
+
+struct inode;
+#define PROC_SUPER_MAGIC	0x9fa0
+#define SUPER_BLOCK_OFF 40
+#define MAGIC_OFF 96
+struct rw_semaphore;
+
+#define U64_MAX				((u64)~0ULL)
 #define HMKPM_TAG			"[HMKPM] "
+
 #define hmkpm_info(fmt, ...)        logki(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_warn(fmt, ...)        logkw(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_error(fmt, ...)       logke(HMKPM_TAG fmt, ##__VA_ARGS__)
 
-#ifndef U64_MAX
-#define U64_MAX ((u64)~0ULL)
-#endif
-
-void *memset(void *s, int c, size_t count) {
+void *memset(void *s, int c, size_t count)
+{
     unsigned char *p = (unsigned char *)s;
-    while (count--) *p++ = (unsigned char)c;
+    while (count--)
+        *p++ = (unsigned char)c;
     return s;
 }
 
-static inline void make_cfi_name(char *dst, size_t dst_size, const char *name) {
+static inline void make_cfi_name(char *dst, size_t dst_size, const char *name)
+{
 	const char *suffix = ".cfi_jt";
 	size_t i = 0;
-	while (name && *name && i + 1 < dst_size) dst[i++] = *name++;
-	while (*suffix && i + 1 < dst_size) dst[i++] = *suffix++;
+	while (name && *name && i + 1 < dst_size)
+		dst[i++] = *name++;
+	while (*suffix && i + 1 < dst_size)
+		dst[i++] = *suffix++;
 	dst[i] = '\0';
 }
 
-static unsigned long hmkpm_lookup_symbol(const char *name) {
+static unsigned long hmkpm_lookup_symbol(const char *name)
+{
 	unsigned long addr;
-	if (!name || !kallsyms_lookup_name) return 0;
+	if (!name || !kallsyms_lookup_name)
+		return 0;
 	addr = kallsyms_lookup_name(name);
 	if (!addr) {
 		char cfi_name[64];
@@ -62,14 +87,22 @@ static unsigned long hmkpm_lookup_symbol(const char *name) {
 	return addr;
 }
 
-#define hkfunc_match(func) do { \
-    kf_##func = (typeof(kf_##func))hmkpm_lookup_symbol(#func); \
-    if (!kf_##func) { hmkpm_error("Failed to find kfunc %s\n", #func); init_error = true; } \
+#define hkfunc_match(func)							\
+do {										\
+	kf_##func = (typeof(kf_##func))hmkpm_lookup_symbol(#func);		\
+	if (!kf_##func) {							\
+		hmkpm_error("Failed to find kfunc %s\n", #func);		\
+		init_error = true;						\
+	}									\
 } while (0)
 
-#define hkvar_match(var) do { \
-    kv_##var = (typeof(kv_##var))hmkpm_lookup_symbol(#var); \
-    if (!kv_##var) { hmkpm_error("Failed to find kvar %s\n", #var); init_error = true; } \
+#define hkvar_match(var)							\
+do {										\
+	kv_##var = (typeof(kv_##var))hmkpm_lookup_symbol(#var);			\
+	if (!kv_##var) {							\
+		hmkpm_error("Failed to find kvar %s\n", #var);			\
+		init_error = true;						\
+	}									\
 } while (0)
 
 void *kfunc_def(memset)(void *s, int c, size_t count);
@@ -86,29 +119,49 @@ u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
 void *kvar_def(init_task);
 
-static bool init_error = false;
-
-static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, size_t size) {
+static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, size_t size)
+{
 	kfunc_call(probe_kernel_read, dst, src, size);
 	return -ENOSYS;
 }
 
-/* ========================================================================
- * 页表遍历核心 (去除多余宏)
- * ======================================================================== */
-static uint64_t pgt_va_bits, pgt_page_offset, pgt_linear_voffset;
-static uint64_t pgt_page_shift, pgt_page_size, pgt_pgd_align_mask, pgt_pgd_size;
-static uint64_t pgt_page_level, pgt_high_memory;
+// ==========================================
+// 必须保留的假结构体，防止编译站点裁剪段
+// ==========================================
+#define HMKPM_MAGIC			0x484D4B504DULL 
+#define HMKPM_BATCH_CHUNK_ENTRIES	64U
+#define HMKPM_MAX_BATCH_ENTRIES		65536U
+#define HMKPM_MAX_ENTRY_SIZE		(64ULL << 20)
+#define HMKPM_MAX_SINGLE_SIZE		(64ULL << 20)
+#define HMKPM_MAX_BATCH_TOTAL_SIZE	(128ULL << 20)
+struct hmkpm_req { int32_t pid; uint32_t _pad; uint64_t addr; uint64_t size; };
+#define HMKPM_REQ_SIZE			((uint64_t)sizeof(struct hmkpm_req))
+
+// ==========================================
+// 页表遍历核心
+// ==========================================
+static uint64_t pgt_va_bits;
+static uint64_t pgt_phys_offset;
+static uint64_t pgt_page_offset;
+static uint64_t pgt_linear_voffset;
+static uint64_t pgt_page_shift;
+static uint64_t pgt_page_size;
+static uint64_t pgt_pgd_align_mask;
+static uint64_t pgt_pgd_size;
+static uint64_t pgt_page_level;
+static uint64_t pgt_high_memory;
 
 static inline uint64_t pgt_phys_to_virt(uint64_t phys) { return phys + pgt_linear_voffset; }
 static inline uint64_t pgt_virt_to_phys(uint64_t addr) { return addr - pgt_linear_voffset; }
 
-static inline uint64_t pgt_desc_to_phys(uint64_t desc) {
+static inline uint64_t pgt_desc_to_phys(uint64_t desc)
+{
 	uint64_t addr_mask = (((1ULL << (48 - pgt_page_shift)) - 1) << pgt_page_shift);
 	return desc & addr_mask;
 }
 
-static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va) {
+static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va)
+{
 	uint64_t table_va, pxd_bits, pxd_ptrs;
 	int64_t start, lv;
 	if (!pgd) return 0;
@@ -157,7 +210,8 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va) {
 	return 0;
 }
 
-static int pgt_pgtable_init(void) {
+static int pgt_pgtable_init(void)
+{
 	uint64_t tcr_el1, t1sz, va1_bits, t0sz, va0_bits, tg0, pxd_bits;
 	int64_t start;
 	asm volatile("mrs %0, tcr_el1" : "=r"(tcr_el1));
@@ -189,15 +243,13 @@ static int pgt_pgtable_init(void) {
 	pgt_linear_voffset = pgt_page_offset - ms;
 
 	hkvar_match(high_memory);
-	if (kv_high_memory) {
-		hmkpm_copy_from_kernel_nofault(&pgt_high_memory, kv_high_memory, 8);
-	} else {
-		pgt_high_memory = ~0ULL;
-	}
+	if (kv_high_memory) hmkpm_copy_from_kernel_nofault(&pgt_high_memory, kv_high_memory, 8);
+	else pgt_high_memory = ~0ULL;
 	return 0;
 }
 
-static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len, void __user *local_buf) {
+static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len, void __user *local_buf)
+{
 	struct task_struct *task = NULL;
 	struct mm_struct *mm = NULL;
 	ssize_t total = 0;
@@ -224,11 +276,7 @@ static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len, void __user *lo
 		chunk = chunk < 256 ? chunk : 256;
 
 		uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, remote_va);
-		if (!tkpa) {
-			if (total > 0) break;
-			kfunc(mmput)(mm);
-			return -EFAULT;
-		}
+		if (!tkpa) { if (total > 0) break; kfunc(mmput)(mm); return -EFAULT; }
 		void *tkva = (void *)pgt_phys_to_virt(tkpa);
 		
 		unsigned long not_copied = kfunc(__arch_copy_to_user)(local_buf, tkva, chunk);
@@ -243,9 +291,9 @@ static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len, void __user *lo
 	return total;
 }
 
-/* ========================================================================
- * Netlink 通信与功能
- * ======================================================================== */
+// ==========================================
+// Netlink 通信层
+// ==========================================
 struct sock;
 struct sk_buff;
 struct nlmsghdr { uint32_t nlmsg_len; uint16_t nlmsg_type; uint16_t nlmsg_flags; uint32_t nlmsg_seq; uint32_t nlmsg_pid; };
@@ -286,7 +334,7 @@ struct hmkpm_nl_req {
 // 5.10 内核稳定偏移量
 #define TASK_MM_OFF         0x540
 #define MM_MMAP_OFF         0x000
-#define MM_ARG_START_OFF    0x2B0  // mm->arg_start (cmdline地址)
+#define MM_ARG_START_OFF    0x2B0
 #define VM_START_OFF        0x000
 #define VM_NEXT_OFF         0x008
 #define VM_FILE_OFF         0x0A0
@@ -312,11 +360,9 @@ static void netlink_recv(struct sk_buff *skb) {
         }
     } 
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_PID) {
-        // 遍历进程，但是用最稳定的方式读取 cmdline 来匹配
         for (int i = 1; i < 32768; i++) {
             struct task_struct *task = NULL;
             struct mm_struct *mm = NULL;
-            
             kfunc(__rcu_read_lock)();
             task = kfunc(find_task_by_vpid)(i);
             if (task) mm = kfunc(get_task_mm)(task);
@@ -324,13 +370,10 @@ static void netlink_recv(struct sk_buff *skb) {
 
             if (mm) {
                 uintptr_t arg_start = 0;
-                // 5.10 的 mm_struct 里 arg_start 存在，直接读出来
                 hmkpm_copy_from_kernel_nofault(&arg_start, (const void *)((uintptr_t)mm + MM_ARG_START_OFF), 8);
                 if (arg_start) {
                     char cmdline[128] = {0};
-                    // 通过目标进程的虚拟地址，用我们自己的 pgt_rw 读出来！
                     if (pgt_rw(i, arg_start, 127, (void __user *)cmdline) > 0) {
-                        // 检查是否匹配
                         int match = 1;
                         for (int j=0; j<63 && req->pkg_name[j]; j++) {
                             if (cmdline[j] != req->pkg_name[j]) { match = 0; break; }
@@ -349,7 +392,6 @@ static void netlink_recv(struct sk_buff *skb) {
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_BASE) {
         struct task_struct *task = NULL;
         struct mm_struct *mm = NULL;
-        
         kfunc(__rcu_read_lock)();
         task = kfunc(find_task_by_vpid)(req->pid);
         if (task) mm = kfunc(get_task_mm)(task);
@@ -415,23 +457,20 @@ static int netlink_init(void) {
     cfg.input = netlink_recv;
 
     g_nl_sk = kf_netlink_create(kv_init_net, 31, NULL, &cfg);
-    if (!g_nl_sk) {
-        hmkpm_error("Netlink create failed on proto 31\n");
-        return -1;
-    }
+    if (!g_nl_sk) return -1;
     hmkpm_info("Netlink registered on 31 (Lockless)\n");
     return 0;
 }
 
-/* ========================================================================
- * 模块生命周期
- * ======================================================================== */
+// ==========================================
+// 模块生命周期
+// ==========================================
 static long module_init_handler(const char *args, const char *event, void *__user reserved)
 {
 	if (kver < VERSION(4, 0, 0) || kver >= VERSION(6, 13, 0)) return -EINVAL;
 	if (pgt_pgtable_init() != 0) return -ENOENT;
 
-	static const char *const arm64_memset_aliases[] = { "__memset", "memset", "__pi___memset", "__pi_memset", "__asan_memset", NULL };
+	static const char *const arm64_memset_aliases[] = { "__memset", "memset", "__pi___memset", NULL };
     for (int i = 0; arm64_memset_aliases[i] != NULL; i++) {
         kf_memset = (typeof(kf_memset))hmkpm_lookup_symbol(arm64_memset_aliases[i]);
         if (kf_memset) break;
@@ -442,10 +481,6 @@ static long module_init_handler(const char *args, const char *event, void *__use
 	if (!kf___arch_copy_to_user) kf___arch_copy_to_user = (typeof(kf___arch_copy_to_user))hmkpm_lookup_symbol("__copy_to_user");
 	if (!kf___arch_copy_to_user) init_error = true;
 
-	kf___arch_copy_from_user = (typeof(kf___arch_copy_from_user))hmkpm_lookup_symbol("__arch_copy_from_user");
-	if (!kf___arch_copy_from_user) kf___arch_copy_from_user = (typeof(kf___arch_copy_from_user))hmkpm_lookup_symbol("__copy_from_user");
-	if (!kf___arch_copy_from_user) init_error = true;
-
 	hkfunc_match(find_task_by_vpid);
 	hkfunc_match(get_task_mm);
 	hkfunc_match(mmput);
@@ -454,7 +489,6 @@ static long module_init_handler(const char *args, const char *event, void *__use
 	hkfunc_match(probe_kernel_read);
 
 	if (init_error) return -ENOENT;
-
     if (netlink_init() != 0) return -ENOENT;
 
 	hmkpm_info("module loaded successfully\n");
