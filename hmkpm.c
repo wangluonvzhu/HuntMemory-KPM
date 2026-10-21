@@ -2,7 +2,7 @@
 /*
  * Copyright (c) 2026 Yervant7
  *
- * KernelPatch Module (KPM) - [HMKPM] Netlink Version
+ * KernelPatch Module (KPM) - [HMKPM] Netlink Version (Fixed)
  */
 
 #include <asm/current.h>
@@ -25,6 +25,44 @@
 #include <uapi/asm-generic/unistd.h>
 #include <asm-generic/rwonce.h>
 
+// ============================================================
+// 补充 KPM 环境缺失的宏和类型定义
+// ============================================================
+#ifndef U64_MAX
+#define U64_MAX ((u64)~0ULL)
+#endif
+
+struct sock;
+struct sk_buff;
+struct nlmsghdr {
+    uint32_t nlmsg_len;
+    uint16_t nlmsg_type;
+    uint16_t nlmsg_flags;
+    uint32_t nlmsg_seq;
+    uint32_t nlmsg_pid;
+};
+
+#define NLMSG_ALIGNTO 4U
+#define NLMSG_ALIGN(len) (((len) + NLMSG_ALIGNTO - 1) & ~(NLMSG_ALIGNTO - 1))
+#define NLMSG_HDRLEN ((int) NLMSG_ALIGN(sizeof(struct nlmsghdr)))
+#define NLMSG_LENGTH(len) ((len) + NLMSG_HDRLEN)
+#define NLMSG_SPACE(len) NLMSG_ALIGN(NLMSG_LENGTH(len))
+#define NLMSG_DATA(nlh) ((void*)(((char*)nlh) + NLMSG_LENGTH(0)))
+
+struct netlink_kernel_cfg {
+    unsigned int groups;
+    void (*input)(struct sk_buff *skb);
+    void *cb_mutex;
+    void *bind;
+    void *unbind;
+};
+
+static void *(*kf_skb_put)(struct sk_buff *skb, unsigned int len);
+static void *(*kf___alloc_skb)(unsigned int size, int gfp_mask);
+
+// 安全的 min 宏
+#define HMKPM_MIN(a, b) ((a) < (b) ? (a) : (b))
+
 #define HMKPM_VERSION_MAJOR	2
 #define HMKPM_VERSION_MINOR	9
 #define HMKPM_VERSION_PATCH	0
@@ -41,7 +79,6 @@ KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM Netlink");
 #define hmkpm_warn(fmt, ...)        logkw(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_error(fmt, ...)       logke(HMKPM_TAG fmt, ##__VA_ARGS__)
 
-// 解决 KPM 没有 libc 的问题
 void *memset(void *s, int c, size_t count)
 {
     unsigned char *p = (unsigned char *)s;
@@ -56,23 +93,15 @@ static inline void make_cfi_name(char *dst, size_t dst_size, const char *name)
 {
 	const char *suffix = ".cfi_jt";
 	size_t i = 0;
-
-	while (name && *name && i + 1 < dst_size)
-		dst[i++] = *name++;
-
-	while (*suffix && i + 1 < dst_size)
-		dst[i++] = *suffix++;
-
+	while (name && *name && i + 1 < dst_size) dst[i++] = *name++;
+	while (*suffix && i + 1 < dst_size) dst[i++] = *suffix++;
 	dst[i] = '\0';
 }
 
 static unsigned long hmkpm_lookup_symbol(const char *name)
 {
 	unsigned long addr;
-
-	if (!name || !kallsyms_lookup_name)
-		return 0;
-
+	if (!name || !kallsyms_lookup_name) return 0;
 	addr = kallsyms_lookup_name(name);
 	if (!addr) {
 		char cfi_name[64];
@@ -146,7 +175,6 @@ static void hmkpm_sw_pan_init(void)
 {
 	if (kp_kconfig_enabled("CONFIG_ARM64_SW_TTBR0_PAN"))
 		sw_pan_enabled = true;
-
 	unsigned long sym_reserved = hmkpm_lookup_symbol("reserved_ttbr0");
 	if (sym_reserved) {
 		uint64_t pa = 0;
@@ -371,7 +399,6 @@ static inline void hmkpm_fast_copy(void *dst, const void *src, size_t n)
 	while (n > 0) { *d++ = *s++; n--; }
 }
 
-// 强制无锁读取
 static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, void __user *local_buf, bool is_write)
 {
 	ssize_t total = 0;
@@ -379,15 +406,15 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 	uint8_t bounce[HMKPM_BOUNCE_SIZE];
 
 	if (!mm || mm_struct_offset.pgd_offset < 0) return -EINVAL;
-	if (is_write) return -EOPNOTSUPP; // 无锁模式下禁止写入
+	if (is_write) return -EOPNOTSUPP;
 
 	if (hmkpm_copy_from_kernel_nofault(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(pgd)) != 0 || !pgd) return -EFAULT;
 
 	while (len > 0) {
 		unsigned long page_off = remote_va & (pgt_page_size - 1);
 		size_t page_left = (size_t)(pgt_page_size - page_off);
-		size_t chunk = min(len, page_left);
-		chunk = min(chunk, (size_t)HMKPM_BOUNCE_SIZE);
+		size_t chunk = HMKPM_MIN(len, page_left);
+		chunk = HMKPM_MIN(chunk, (size_t)HMKPM_BOUNCE_SIZE);
 
 		uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, remote_va, false);
 		if (!tkpa) {
@@ -435,16 +462,6 @@ static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len, void __user *lo
 /* ========================================================================
  * Netlink 通信模块
  * ======================================================================== */
-struct sock;
-struct sk_buff;
-struct netlink_kernel_cfg {
-    unsigned int groups;
-    void (*input)(struct sk_buff *skb);
-    void *cb_mutex;
-    void *bind;
-    void *unbind;
-};
-
 #define HMKPM_NL_CMD_READ 0x55
 
 struct hmkpm_nl_req {
@@ -458,7 +475,6 @@ struct hmkpm_nl_req {
 static struct sock *(*kf_netlink_kernel_create)(void *net, int unit, void *module, struct netlink_kernel_cfg *cfg);
 static int (*kf_netlink_unicast)(struct sock *ssk, struct sk_buff *skb, uint32_t portid, int nonblock);
 static void (*kf_netlink_kernel_release)(struct sock *sk);
-static struct sk_buff *(*kf_alloc_skb)(unsigned int size, int gfp_mask);
 static void *kv_init_net = NULL;
 
 static struct sock *g_nl_sk = NULL;
@@ -473,11 +489,16 @@ static void hmkpm_netlink_input(struct sk_buff *skb)
     int *status_out;
     ssize_t read_ret;
     uint32_t user_pid;
+    char *skb_data;
 
     if (!skb) return;
 
-    nlh = (struct nlmsghdr *)skb->data;
-    if (!nlh || nlh->nlmsg_len < sizeof(struct hmkpm_nl_req) || nlh->nlmsg_type != HMKPM_NL_CMD_READ)
+    // 5.10 内核的 sk_buff->data 偏移大概在 0xD8 (216)，这里直接用 KPM 的指针读取
+    if (hmkpm_copy_from_kernel_nofault(&skb_data, (const void *)((uintptr_t)skb + 0xD8), sizeof(skb_data)) != 0 || !skb_data)
+        return;
+
+    nlh = (struct nlmsghdr *)skb_data;
+    if (nlh->nlmsg_len < sizeof(struct hmkpm_nl_req) || nlh->nlmsg_type != HMKPM_NL_CMD_READ)
         return;
 
     req = (struct hmkpm_nl_req *)NLMSG_DATA(nlh);
@@ -485,11 +506,11 @@ static void hmkpm_netlink_input(struct sk_buff *skb)
 
     read_ret = pgt_rw((pid_t)req->pid, req->addr, req->size, (void __user *)(uintptr_t)req->user_buf, false);
 
-    if (!kf_alloc_skb || !kf_netlink_unicast) return;
-    skb_out = kf_alloc_skb(32, 0); // GFP_ATOMIC
+    if (!kf___alloc_skb || !kf_netlink_unicast || !kf_skb_put) return;
+    skb_out = kf___alloc_skb(32, 0); // GFP_ATOMIC
     if (!skb_out) return;
 
-    nlh_out = (struct nlmsghdr *)skb_put(skb_out, NLMSG_SPACE(sizeof(int)));
+    nlh_out = (struct nlmsghdr *)kf_skb_put(skb_out, NLMSG_SPACE(sizeof(int)));
     nlh_out->nlmsg_len = NLMSG_SPACE(sizeof(int));
     nlh_out->nlmsg_type = 0; 
     nlh_out->nlmsg_flags = 0;
@@ -505,16 +526,17 @@ static void hmkpm_netlink_input(struct sk_buff *skb)
 static int hmkpm_netlink_init(void)
 {
     struct netlink_kernel_cfg cfg;
-    int try_protos[] = {22, 23, 24, 25, 26}; // 动态探测
+    int try_protos[] = {22, 23, 24, 25, 26};
     int i;
 
     kf_netlink_kernel_create = (void *)hmkpm_lookup_symbol("__netlink_kernel_create");
     kf_netlink_unicast       = (void *)hmkpm_lookup_symbol("netlink_unicast");
     kf_netlink_kernel_release= (void *)hmkpm_lookup_symbol("netlink_kernel_release");
-    kf_alloc_skb             = (void *)hmkpm_lookup_symbol("__alloc_skb");
+    kf___alloc_skb           = (void *)hmkpm_lookup_symbol("__alloc_skb");
+    kf_skb_put               = (void *)hmkpm_lookup_symbol("skb_put");
     kv_init_net              = (void *)hmkpm_lookup_symbol("init_net");
 
-    if (!kf_netlink_kernel_create || !kf_netlink_unicast || !kf_alloc_skb || !kv_init_net) {
+    if (!kf_netlink_kernel_create || !kf_netlink_unicast || !kf___alloc_skb || !kv_init_net) {
         hmkpm_error("netlink symbols not found\n");
         return -ENOENT;
     }
