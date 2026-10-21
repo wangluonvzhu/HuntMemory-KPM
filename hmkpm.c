@@ -550,29 +550,55 @@ static void netlink_recv(struct sk_buff *skb) {
         }
     } 
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_PID) {
-        hmkpm_info("Start GET_PID via vpid loop, target: %s\n", req->pkg_name);
-        uint64_t comm_offsets[] = {0x730, 0x738, 0x728, 0x740, 0x720};
-        int num_offsets = sizeof(comm_offsets) / sizeof(comm_offsets[0]);
+        hmkpm_info("Start GET_PID via init_task task list, target: %s\n", req->pkg_name);
+        
+        unsigned long init_task_addr = hmkpm_lookup_symbol("init_task");
+        if (!init_task_addr) {
+            hmkpm_error("init_task symbol not found!\n");
+        } else {
+            // 小米 5.10 task_struct->tasks 偏移通常是 0x550 或 0x558
+            uint64_t tasks_offsets[] = {0x550, 0x558, 0x548, 0x540};
+            // task_struct->comm 偏移通常是 0x730 或 0x738
+            uint64_t comm_offsets[] = {0x730, 0x738, 0x728, 0x740, 0x720};
+            
+            int num_tasks = sizeof(tasks_offsets) / sizeof(tasks_offsets[0]);
+            int num_comm = sizeof(comm_offsets) / sizeof(comm_offsets[0]);
 
-        for (int i = 1; i < 32768; i++) {
-            struct task_struct *task = NULL;
-            kfunc(__rcu_read_lock)();
-            task = kfunc(find_task_by_vpid)(i);
-            kfunc(__rcu_read_unlock)();
+            for (int t_idx = 0; t_idx < num_tasks; t_idx++) {
+                uint64_t tasks_off = tasks_offsets[t_idx];
+                uintptr_t list_head = init_task_addr + tasks_off;
+                uintptr_t current_node = 0;
+                hmkpm_copy_from_kernel_nofault(&current_node, (const void *)(list_head), 8); // 读 init_task->tasks.next
 
-            if (task) {
-                for (int k = 0; k < num_offsets; k++) {
-                    char kcomm[17] = {0};
-                    hmkpm_copy_from_kernel_nofault(kcomm, (const void *)((uintptr_t)task + comm_offsets[k]), 16);
-                    if (kcomm[0] != '\0') {
-                        // 打印出来看看，如果全是乱码或者空，说明偏移都错了
-                        // hmkpm_info("PID %d off 0x%llx: %s\n", i, comm_offsets[k], kcomm);
-                        if (hmkpm_strstr(kcomm, "tmgp")) { 
-                            hmkpm_info("!!! Found target PID: %d (comm: %s) via offset 0x%llx !!!\n", i, kcomm, comm_offsets[k]);
-                            result = (uint64_t)i;
-                            goto found_pid;
+                int loop_guard = 0;
+                while (current_node != list_head && loop_guard++ < 10000) {
+                    // 通过 next 指针反推 task_struct 的基地址
+                    uintptr_t task_addr = current_node - tasks_off;
+                    
+                    for (int c_idx = 0; c_idx < num_comm; c_idx++) {
+                        char kcomm[17] = {0};
+                        hmkpm_copy_from_kernel_nofault(kcomm, (const void *)(task_addr + comm_offsets[c_idx]), 16);
+                        
+                        if (kcomm[0] != '\0') {
+                            if (hmkpm_strstr(kcomm, "tmgp")) { 
+                                // 如果 comm 匹配，尝试找 pid（通常在 0x5d8）
+                                int kpid = 0;
+                                hmkpm_copy_from_kernel_nofault(&kpid, (const void *)(task_addr + 0x5d8), 4);
+                                if (kpid == 0) { // 再试几个常用 pid 偏移
+                                    hmkpm_copy_from_kernel_nofault(&kpid, (const void *)(task_addr + 0x5b8), 4);
+                                }
+                                if (kpid > 0) {
+                                    hmkpm_info("!!! Found target PID: %d (comm: %s) via task_list_off 0x%llx !!!\n", kpid, kcomm, tasks_off);
+                                    result = (uint64_t)kpid;
+                                    goto found_pid;
+                                }
+                            }
                         }
                     }
+                    // 读取 next 指针
+                    uintptr_t next_node = 0;
+                    hmkpm_copy_from_kernel_nofault(&next_node, (const void *)(current_node), 8);
+                    current_node = next_node;
                 }
             }
         }
@@ -580,11 +606,52 @@ static void netlink_recv(struct sk_buff *skb) {
     }
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_BASE) {
         hmkpm_info("Start GET_BASE for PID: %d, mod: %s\n", req->pid, req->mod_name);
+        // 这里用 find_task_by_vpid 可能依然拿不到 mm，所以也加上遍历
         struct task_struct *task = NULL; struct mm_struct *mm = NULL;
+        
+        // 先用 find_task_by_vpid 试一下，如果返回 null，就用链表找
         kfunc(__rcu_read_lock)(); 
         task = kfunc(find_task_by_vpid)(req->pid);
         if (task) mm = kfunc(get_task_mm)(task);
         kfunc(__rcu_read_unlock)();
+
+        if (!mm) {
+            // 尝试通过 task list 找 mm
+            unsigned long init_task_addr = hmkpm_lookup_symbol("init_task");
+            if (init_task_addr) {
+                uint64_t tasks_offsets[] = {0x550, 0x558, 0x548, 0x540};
+                int num_tasks = sizeof(tasks_offsets) / sizeof(tasks_offsets[0]);
+
+                for (int t_idx = 0; t_idx < num_tasks; t_idx++) {
+                    uint64_t tasks_off = tasks_offsets[t_idx];
+                    uintptr_t list_head = init_task_addr + tasks_off;
+                    uintptr_t current_node = 0;
+                    hmkpm_copy_from_kernel_nofault(&current_node, (const void *)(list_head), 8);
+
+                    int loop_guard = 0;
+                    while (current_node != list_head && loop_guard++ < 10000) {
+                        uintptr_t task_addr = current_node - tasks_off;
+                        int kpid = 0;
+                        hmkpm_copy_from_kernel_nofault(&kpid, (const void *)(task_addr + 0x5d8), 4);
+                        if (kpid == 0) hmkpm_copy_from_kernel_nofault(&kpid, (const void *)(task_addr + 0x5b8), 4);
+                        
+                        if (kpid == req->pid) {
+                            // 读 mm 指针，偏移通常是 0x540 或 0x548
+                            hmkpm_copy_from_kernel_nofault(&mm, (const void *)(task_addr + 0x540), 8);
+                            if (!mm) hmkpm_copy_from_kernel_nofault(&mm, (const void *)(task_addr + 0x548), 8);
+                            if (mm) {
+                                // 不需要 mmput，因为我们在内核里直接拿到了引用
+                                break;
+                            }
+                        }
+                        uintptr_t next_node = 0;
+                        hmkpm_copy_from_kernel_nofault(&next_node, (const void *)(current_node), 8);
+                        current_node = next_node;
+                    }
+                    if (mm) break;
+                }
+            }
+        }
 
         if (mm) {
             uintptr_t vma = 0;
@@ -615,7 +682,7 @@ static void netlink_recv(struct sk_buff *skb) {
                 hmkpm_copy_from_kernel_nofault(&next_vma, (const void *)(vma + 0x008), 8);
                 vma = next_vma;
             }
-            kfunc(mmput)(mm);
+            if (task) kfunc(mmput)(mm);
         }
     }
 
