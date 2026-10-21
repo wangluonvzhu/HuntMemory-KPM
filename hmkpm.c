@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2026 Yervant7
- * KernelPatch Module (KPM) - [HMKPM] Netlink Pure Version
+ * KernelPatch Module (KPM) - [HMKPM] Netlink Full
  */
 
 #include <asm/current.h>
@@ -27,13 +27,13 @@
 #define HMKPM_VERSION_MAJOR	2
 #define HMKPM_VERSION_MINOR	8
 #define HMKPM_VERSION_PATCH	0
-#define HMKPM_VERSION_STR	"2.8.0-netlink-pure"
+#define HMKPM_VERSION_STR	"2.8.0-netlink-full"
 
 KPM_NAME("HMKPM");
 KPM_VERSION(HMKPM_VERSION_STR);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
-KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM Netlink Pure");
+KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM Netlink Full");
 
 static bool hook_active = true;
 static bool init_error = false;
@@ -123,6 +123,7 @@ void kfunc_def(up_read)(struct rw_semaphore *sem);
 
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
+void *kvar_def(init_task);
 
 struct inode_min {
     char pad[SUPER_BLOCK_OFF];
@@ -389,77 +390,6 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write)
 	return 0;
 }
 
-static uint64_t pgt_pgtable_inspect(uint64_t pgd, uint64_t va, uint32_t *out_flags, uint32_t *out_page_size)
-{
-	uint64_t table_va, pxd_bits, pxd_ptrs;
-	int64_t start, lv;
-	if (out_flags) *out_flags = 0;
-	if (out_page_size) *out_page_size = 0;
-	if (!pgd) return 0;
-	if (pgd & pgt_pgd_align_mask) return 0;
-	if (validate_virt_range(pgd, pgt_pgd_size)) return 0;
-	va = pgt_untag_user_va(va);
-	if (va >> pgt_va_bits) return 0;
-	table_va = pgd;
-	pxd_bits = pgt_page_shift - 3;
-	pxd_ptrs = 1ULL << pxd_bits;
-	start = 4 - (int64_t)pgt_page_level;
-
-	for (lv = start; lv < 4; lv++) {
-		uint64_t pxd_shift, pxd_index, top_bits, entry_va, desc = 0, type;
-		uint64_t cur_table_size = (lv == start) ? pgt_pgd_size : pgt_page_size;
-		if (validate_virt_range(table_va, cur_table_size)) return 0;
-		pxd_shift = (pgt_page_shift - 3) * (4 - lv) + 3;
-		if (pxd_shift >= pgt_va_bits) return 0;
-		pxd_index = (va >> pxd_shift) & (pxd_ptrs - 1);
-		top_bits = pgt_va_bits - pxd_shift;
-		if (top_bits > pxd_bits) top_bits = pxd_bits;
-		if (top_bits == 0 || pxd_index >= (1ULL << top_bits)) return 0;
-		entry_va = table_va + pxd_index * 8;
-		if (hmkpm_copy_from_kernel_nofault(&desc, (const void *)entry_va, sizeof(desc)) != 0) return 0;
-		type = desc & 3ULL;
-		if (type == 0ULL || type == 2ULL) return 0;
-
-		if (lv == 3) {
-			uint64_t base;
-			uint32_t flags = HMKPM_PAGE_FLAG_PRESENT;
-			if (type != 3ULL) return 0;
-			if ((desc & (1ULL << 7)) && !(desc & (1ULL << 51))) flags |= HMKPM_PAGE_FLAG_RO;
-			if (desc & ((1ULL << 55) | (1ULL << 51))) flags |= HMKPM_PAGE_FLAG_DIRTY;
-			base = pgt_desc_to_phys(desc);
-			if (base & (pgt_page_size - 1)) return 0;
-			if (validate_phys_range(base, pgt_page_size)) return 0;
-			if (out_flags) *out_flags = flags;
-			if (out_page_size) *out_page_size = (uint32_t)pgt_page_size;
-			return base | (va & (pgt_page_size - 1));
-		}
-
-		if (type == 1ULL) {
-			uint64_t block_bits, block_size, block_mask, base;
-			uint32_t flags = HMKPM_PAGE_FLAG_PRESENT | HMKPM_PAGE_FLAG_BLOCK;
-			if (!pgt_block_allowed((int)lv)) return 0;
-			if ((desc & (1ULL << 7)) && !(desc & (1ULL << 51))) flags |= HMKPM_PAGE_FLAG_RO;
-			if (desc & ((1ULL << 55) | (1ULL << 51))) flags |= HMKPM_PAGE_FLAG_DIRTY;
-			block_bits = (uint64_t)(3 - lv) * pxd_bits + pgt_page_shift;
-			if (block_bits >= 64) return 0;
-			block_size = 1ULL << block_bits;
-			block_mask = block_size - 1;
-			base = pgt_desc_to_phys(desc);
-			if (base & block_mask) return 0;
-			if (validate_phys_range(base, block_size)) return 0;
-			if (out_flags) *out_flags = flags;
-			if (out_page_size) *out_page_size = (uint32_t)block_size;
-			return (base & ~block_mask) | (va & block_mask);
-		}
-
-		uint64_t next_pa = pgt_desc_to_phys(desc);
-		if (next_pa & (pgt_page_size - 1)) return 0;
-		if (validate_phys_range(next_pa, pgt_page_size)) return 0;
-		table_va = pgt_phys_to_virt(next_pa);
-	}
-	return 0;
-}
-
 static int pgt_pgtable_init(void)
 {
 	uint64_t tcr_el1, t1sz, va1_bits, t0sz, va0_bits, tg0, pxd_bits;
@@ -656,13 +586,32 @@ static void *(*kf_skb_put)(struct sk_buff *skb, unsigned int len);
 static void *kv_init_net = NULL;
 static struct sock *g_nl_sk = NULL;
 
+// 自定义命令字
+#define HMKPM_NL_CMD_READ     0x55
+#define HMKPM_NL_CMD_GET_PID  0x56
+#define HMKPM_NL_CMD_GET_BASE 0x57
+
 struct hmkpm_nl_req {
     int32_t pid;
     uint32_t _pad;
     uint64_t addr;
     uint64_t size;
     uint64_t user_buf;
+    char pkg_name[64];
+    char mod_name[64];
 };
+
+// 5.10 ARM64 内核结构体偏移量推算
+#define TASK_TASKS_OFF      0x298
+#define TASK_COMM_OFF       0x5B0
+#define TASK_PID_OFF        0x5C8
+#define TASK_MM_OFF         0x540
+#define MM_MMAP_OFF         0x000
+#define VM_START_OFF        0x000
+#define VM_NEXT_OFF         0x008
+#define VM_FILE_OFF         0x0A0
+#define FILE_PATH_OFF       0x018
+#define DENTRY_INAME_OFF    0x038
 
 static void netlink_recv(struct sk_buff *skb) {
     if (!skb) return;
@@ -676,19 +625,94 @@ static void netlink_recv(struct sk_buff *skb) {
     uint32_t user_pid = nlh->nlmsg_pid;
 
     long ret = -1;
-    if (req->pid > 0) {
-        ssize_t r = pgt_rw((pid_t)req->pid, req->addr, req->size, (void __user *)(uintptr_t)req->user_buf, false);
-        if (r == req->size) ret = 0;
+    uint64_t result = 0;
+
+    if (nlh->nlmsg_type == HMKPM_NL_CMD_READ) {
+        if (req->pid > 0) {
+            ssize_t r = pgt_rw((pid_t)req->pid, req->addr, req->size, (void __user *)(uintptr_t)req->user_buf, false);
+            if (r == req->size) ret = 0;
+        }
+        result = (uint64_t)ret;
+    } 
+    else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_PID) {
+        struct task_struct *task = (struct task_struct *)kv_init_task;
+        struct list_head *pos = (struct list_head *)((uintptr_t)task + TASK_TASKS_OFF);
+        struct list_head *start = pos;
+        uint64_t next_ptr = 0;
+
+        while (1) {
+            struct task_struct *curr = (struct task_struct *)((uintptr_t)pos - TASK_TASKS_OFF);
+            int32_t tpid;
+            char comm[16];
+            hmkpm_copy_from_kernel_nofault(&tpid, (const void *)((uintptr_t)curr + TASK_PID_OFF), 4);
+            hmkpm_copy_from_kernel_nofault(comm, (const void *)((uintptr_t)curr + TASK_COMM_OFF), 15);
+
+            int match = 1;
+            for (int i=0; i<15 && req->pkg_name[i]; i++) {
+                if (comm[i] != req->pkg_name[i]) { match = 0; break; }
+            }
+            if (match && tpid > 0) {
+                result = (uint64_t)tpid;
+                break;
+            }
+
+            hmkpm_copy_from_kernel_nofault(&next_ptr, (const void *)pos, 8);
+            if (next_ptr == (uintptr_t)start || !next_ptr) break;
+            pos = (struct list_head *)next_ptr;
+        }
+    }
+    else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_BASE) {
+        struct task_struct *task = NULL;
+        struct mm_struct *mm = NULL;
+        
+        kfunc(__rcu_read_lock)();
+        task = kfunc(find_task_by_vpid)(req->pid);
+        if (task) mm = kfunc(get_task_mm)(task);
+        kfunc(__rcu_read_unlock)();
+
+        if (mm) {
+            uintptr_t vma = 0;
+            hmkpm_copy_from_kernel_nofault(&vma, (const void *)((uintptr_t)mm + MM_MMAP_OFF), 8);
+            while (vma) {
+                uintptr_t file = 0;
+                hmkpm_copy_from_kernel_nofault(&file, (const void *)(vma + VM_FILE_OFF), 8);
+                if (file) {
+                    uintptr_t path = 0;
+                    hmkpm_copy_from_kernel_nofault(&path, (const void *)(file + FILE_PATH_OFF), 8);
+                    if (path) {
+                        uintptr_t dentry = 0;
+                        hmkpm_copy_from_kernel_nofault(&dentry, (const void *)(path + 8), 8);
+                        if (dentry) {
+                            char iname[32];
+                            hmkpm_copy_from_kernel_nofault(iname, (const void *)(dentry + DENTRY_INAME_OFF), 31);
+                            
+                            int match = 1;
+                            for (int i=0; i<31 && req->mod_name[i]; i++) {
+                                if (iname[i] != req->mod_name[i]) { match = 0; break; }
+                            }
+                            if (match) {
+                                hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + VM_START_OFF), 8);
+                                break;
+                            }
+                        }
+                    }
+                }
+                uintptr_t next_vma = 0;
+                hmkpm_copy_from_kernel_nofault(&next_vma, (const void *)(vma + VM_NEXT_OFF), 8);
+                vma = next_vma;
+            }
+            kfunc(mmput)(mm);
+        }
     }
 
     if (kf_alloc_skb && kf_netlink_unicast && kf_skb_put) {
-        struct sk_buff *skb_out = kf_alloc_skb(32, 0); 
+        struct sk_buff *skb_out = kf_alloc_skb(64, 0); 
         if (skb_out) {
-            struct nlmsghdr *nlh_out = (struct nlmsghdr *)kf_skb_put(skb_out, NLMSG_SPACE(4));
-            nlh_out->nlmsg_len = NLMSG_SPACE(4);
+            struct nlmsghdr *nlh_out = (struct nlmsghdr *)kf_skb_put(skb_out, NLMSG_SPACE(8));
+            nlh_out->nlmsg_len = NLMSG_SPACE(8);
             nlh_out->nlmsg_type = 0;
             nlh_out->nlmsg_pid = 0;
-            *(int*)NLMSG_DATA(nlh_out) = (int)ret;
+            *(uint64_t*)NLMSG_DATA(nlh_out) = result;
             kf_netlink_unicast(g_nl_sk, skb_out, user_pid, 0);
         }
     }
@@ -700,8 +724,9 @@ static int netlink_init(void) {
     kf_alloc_skb = (void*)hmkpm_lookup_symbol("__alloc_skb");
     kf_skb_put = (void*)hmkpm_lookup_symbol("skb_put");
     kv_init_net = (void*)hmkpm_lookup_symbol("init_net");
+    kv_init_task = (void*)hmkpm_lookup_symbol("init_task");
 
-    if (!kf_netlink_create || !kf_netlink_unicast || !kf_alloc_skb || !kf_skb_put || !kv_init_net) {
+    if (!kf_netlink_create || !kf_netlink_unicast || !kf_alloc_skb || !kf_skb_put || !kv_init_net || !kv_init_task) {
         hmkpm_error("Netlink symbols missing\n");
         return -1;
     }
