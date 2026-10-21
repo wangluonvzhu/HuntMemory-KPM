@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2026 Yervant7
- * KernelPatch Module (KPM) - [HMKPM]
+ * KernelPatch Module (KPM) - [HMKPM] Netlink Pure Version
  */
 
 #include <asm/current.h>
@@ -27,16 +27,13 @@
 #define HMKPM_VERSION_MAJOR	2
 #define HMKPM_VERSION_MINOR	8
 #define HMKPM_VERSION_PATCH	0
-#define HMKPM_VERSION_CODE	(((uint32_t)HMKPM_VERSION_MAJOR << 16) | \
-				 ((uint32_t)HMKPM_VERSION_MINOR << 8) | \
-				 ((uint32_t)HMKPM_VERSION_PATCH))
-#define HMKPM_VERSION_STR	"2.8.0-netlink"
+#define HMKPM_VERSION_STR	"2.8.0-netlink-pure"
 
 KPM_NAME("HMKPM");
 KPM_VERSION(HMKPM_VERSION_STR);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
-KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM");
+KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM Netlink Pure");
 
 static bool hook_active = true;
 static bool init_error = false;
@@ -163,39 +160,7 @@ static void before_fsnotify(hook_fargs7_t *args, void *udata)
     }
 }
 
-#define HMKPM_MAGIC			0x484D4B504DULL /* "HMKPM" */
-#define HMKPM_MAGIC_READ		(HMKPM_MAGIC + 1)
-#define HMKPM_MAGIC_WRITE		(HMKPM_MAGIC + 2)
-#define HMKPM_MAGIC_READ_BATCH		(HMKPM_MAGIC + 3)
-#define HMKPM_MAGIC_WRITE_BATCH		(HMKPM_MAGIC + 4)
-#define HMKPM_MAGIC_V2P_BATCH		(HMKPM_MAGIC + 5)
-#define HMKPM_MAGIC_SCAN_KERNEL		(HMKPM_MAGIC + 6)
-#define HMKPM_MAGIC_MAX			HMKPM_MAGIC_SCAN_KERNEL
-
-#define HMKPM_FEATURE_READ		(1ULL << 0)
-#define HMKPM_FEATURE_WRITE		(1ULL << 1)
-#define HMKPM_FEATURE_READ_BATCH	(1ULL << 2)
-#define HMKPM_FEATURE_WRITE_BATCH	(1ULL << 3)
-#define HMKPM_FEATURE_V2P_BATCH		(1ULL << 4)
-#define HMKPM_FEATURE_SCAN_KERNEL	(1ULL << 5)
-#define HMKPM_FEATURE_LOCKLESS		(1ULL << 6)
-#define HMKPM_ALL_FEATURES		(HMKPM_FEATURE_READ | HMKPM_FEATURE_WRITE | \
-					 HMKPM_FEATURE_READ_BATCH | HMKPM_FEATURE_WRITE_BATCH | \
-					 HMKPM_FEATURE_V2P_BATCH | HMKPM_FEATURE_SCAN_KERNEL)
-
-struct hmkpm_version_info {
-	uint64_t magic;
-	uint32_t version_code;
-	uint16_t version_major;
-	uint16_t version_minor;
-	uint16_t version_patch;
-	uint8_t  is_lockless;
-	uint8_t  _pad;
-	int32_t  mmap_lock_offset;
-	uint64_t features;
-	char version_str[16];
-};
-
+// 保留必要的数据结构用于 Batch
 #define HMKPM_BATCH_CHUNK_ENTRIES	64U
 #define HMKPM_MAX_BATCH_ENTRIES		65536U
 #define HMKPM_MAX_ENTRY_SIZE		(64ULL << 20)
@@ -207,84 +172,16 @@ struct hmkpm_version_info {
 #define HMKPM_PAGE_FLAG_DIRTY		(1U << 2)
 #define HMKPM_PAGE_FLAG_BLOCK		(1U << 3)
 
+struct hmkpm_v2p_hdr { int32_t pid; uint32_t _pad; uint64_t count; };
+struct hmkpm_v2p_entry { uint64_t va; uint64_t pa; uint32_t flags; uint32_t page_size; };
+#define HMKPM_V2P_HDR_SIZE		((uint64_t)sizeof(struct hmkpm_v2p_hdr))
+#define HMKPM_V2P_ENTRY_SIZE		((uint64_t)sizeof(struct hmkpm_v2p_entry))
 #define HMKPM_V2P_CHUNK_ENTRIES		64U
 #define HMKPM_MAX_V2P_ENTRIES		65536U
 
-struct hmkpm_v2p_hdr {
-	int32_t pid;
-	uint32_t _pad;
-	uint64_t count;
-};
-
-struct hmkpm_v2p_entry {
-	uint64_t va;
-	uint64_t pa;
-	uint32_t flags;
-	uint32_t page_size;
-};
-
-#define HMKPM_V2P_HDR_SIZE		((uint64_t)sizeof(struct hmkpm_v2p_hdr))
-#define HMKPM_V2P_ENTRY_SIZE		((uint64_t)sizeof(struct hmkpm_v2p_entry))
-
-enum hmkpm_scan_type {
-	HMKPM_SCAN_TYPE_I8	= 1, HMKPM_SCAN_TYPE_U8	= 2, HMKPM_SCAN_TYPE_I16	= 3,
-	HMKPM_SCAN_TYPE_U16	= 4, HMKPM_SCAN_TYPE_I32	= 5, HMKPM_SCAN_TYPE_U32	= 6,
-	HMKPM_SCAN_TYPE_I64	= 7, HMKPM_SCAN_TYPE_U64	= 8, HMKPM_SCAN_TYPE_F32	= 9,
-	HMKPM_SCAN_TYPE_F64	= 10, HMKPM_SCAN_TYPE_BYTES	= 11,
-};
-
-enum hmkpm_scan_op {
-	HMKPM_SCAN_OP_EXACT	= 1, HMKPM_SCAN_OP_RANGE	= 2, HMKPM_SCAN_OP_MASK	= 3,
-};
-
-#define HMKPM_MAX_SCAN_RANGES		4096U
-#define HMKPM_MAX_PATTERN_LEN		256U
-#define HMKPM_MAX_SCAN_MATCHES		1048576U
-#define HMKPM_SCAN_MATCH_CHUNK		64U
-
-struct hmkpm_scan_range {
-	uint64_t start_va;
-	uint64_t size;
-};
-
-struct hmkpm_scan_hdr {
-	int32_t pid;
-	uint8_t type;
-	uint8_t op;
-	uint8_t align;
-	uint8_t _pad;
-	uint32_t range_count;
-	uint32_t max_matches;
-	uint64_t pattern_len;
-	union {
-		struct { uint64_t val; uint64_t mask; } exact;
-		struct { uint64_t min; uint64_t max; } range_u;
-		struct { int64_t min; int64_t max; } range_i;
-	} criteria;
-	uint64_t matches_found;
-};
-
-#define HMKPM_SCAN_HDR_SIZE		((uint64_t)sizeof(struct hmkpm_scan_hdr))
-#define HMKPM_SCAN_RANGE_SIZE		((uint64_t)sizeof(struct hmkpm_scan_range))
-
-struct hmkpm_batch_hdr {
-	int32_t pid;
-	uint32_t _pad;
-	uint64_t count;
-	uint64_t data_total;
-};
-
-struct hmkpm_batch_entry {
-	uint64_t addr;
-	uint64_t size;
-};
-
-struct hmkpm_req {
-	int32_t pid;
-	uint32_t _pad;
-	uint64_t addr;
-	uint64_t size;
-};
+struct hmkpm_batch_hdr { int32_t pid; uint32_t _pad; uint64_t count; uint64_t data_total; };
+struct hmkpm_batch_entry { uint64_t addr; uint64_t size; };
+struct hmkpm_req { int32_t pid; uint32_t _pad; uint64_t addr; uint64_t size; };
 
 #define HMKPM_BATCH_HDR_SIZE		((uint64_t)sizeof(struct hmkpm_batch_hdr))
 #define HMKPM_BATCH_ENTRY_SIZE		((uint64_t)sizeof(struct hmkpm_batch_entry))
@@ -624,17 +521,8 @@ static inline int hmkpm_user_range_ok(const void __user *ptr, uint64_t len)
 	return 1;
 }
 
-static __always_inline bool is_hmkpm_magic(uint64_t magic) { return magic >= HMKPM_MAGIC && magic <= HMKPM_MAGIC_MAX; }
 #define min(a, b) ((a) < (b) ? (a) : (b))
 static inline bool hmkpm_is_lockless(void) { return (mmap_lock_sem_offset < 0); }
-
-static inline uint64_t hmkpm_get_active_features(void)
-{
-	uint64_t feat = HMKPM_FEATURE_READ | HMKPM_FEATURE_READ_BATCH | HMKPM_FEATURE_V2P_BATCH | HMKPM_FEATURE_SCAN_KERNEL;
-	if (!hmkpm_is_lockless()) feat |= (HMKPM_FEATURE_WRITE | HMKPM_FEATURE_WRITE_BATCH);
-	else feat |= HMKPM_FEATURE_LOCKLESS;
-	return feat;
-}
 
 static inline void hmkpm_mmap_read_lock(struct mm_struct *mm)
 {
@@ -738,239 +626,7 @@ static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len, void __user *lo
 	return ret;
 }
 
-static void hmkpm_handle_single(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic)
-{
-	struct hmkpm_req req;
-	void __user *data_ptr;
-	bool write_op = (magic == HMKPM_MAGIC_WRITE);
-	ssize_t ret;
-	if (total_len < HMKPM_REQ_SIZE) { args->ret = (uint64_t)(long)-EINVAL; return; }
-	if (hmkpm_copy_from_user(&req, user_ptr, HMKPM_REQ_SIZE) != 0) { args->ret = (uint64_t)(long)-EFAULT; return; }
-	if (req.size == 0) { if (total_len != HMKPM_REQ_SIZE) args->ret = (uint64_t)(long)-EINVAL; else args->ret = 0; return; }
-	if ((uint64_t)req.size > HMKPM_MAX_SINGLE_SIZE) { args->ret = (uint64_t)(long)-E2BIG; return; }
-	if (total_len != HMKPM_REQ_SIZE + (uint64_t)req.size) { args->ret = (uint64_t)(long)-EINVAL; return; }
-	if (req.pid <= 0) { args->ret = (uint64_t)(long)-EINVAL; return; }
-	req.addr = pgt_untag_user_va(req.addr);
-	if (req.addr > U64_MAX - (uint64_t)req.size) { args->ret = (uint64_t)(long)-EINVAL; return; }
-	data_ptr = (void __user *)((uint8_t __user *)user_ptr + HMKPM_REQ_SIZE);
-	ret = pgt_rw((pid_t)req.pid, req.addr, req.size, data_ptr, write_op);
-	if (ret < 0) args->ret = (uint64_t)(long)ret;
-	else if ((uint64_t)ret != req.size) args->ret = (uint64_t)(long)-EFAULT;
-	else args->ret = 0;
-}
-
-static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len, uint64_t magic)
-{
-	bool write_op = (magic == HMKPM_MAGIC_WRITE_BATCH);
-	struct hmkpm_batch_hdr hdr;
-	struct hmkpm_batch_entry chunk[HMKPM_BATCH_CHUNK_ENTRIES];
-	uint64_t entries_bytes, entries_end, data_start, io_end, data_off = 0;
-	uint32_t done = 0;
-	int rc = 0;
-	struct task_struct *task = NULL;
-	struct mm_struct *mm = NULL;
-
-	if (total_len < HMKPM_BATCH_HDR_SIZE) { rc = -EINVAL; goto out; }
-	if (hmkpm_copy_from_user(&hdr, user_ptr, HMKPM_BATCH_HDR_SIZE) != 0) { rc = -EFAULT; goto out; }
-	if (hdr.count == 0) {
-		if (hdr.data_total != 0) { rc = -EINVAL; goto out; }
-		if (write_op) { if (total_len != HMKPM_BATCH_HDR_SIZE) rc = -EINVAL; }
-		else { if (total_len < HMKPM_BATCH_HDR_SIZE) rc = -EINVAL; }
-		goto out;
-	}
-	if (hdr.count > HMKPM_MAX_BATCH_ENTRIES) { rc = -E2BIG; goto out; }
-	if (hdr.data_total > HMKPM_MAX_BATCH_TOTAL_SIZE) { rc = -E2BIG; goto out; }
-	if (hdr.pid <= 0) { rc = -EINVAL; goto out; }
-
-	entries_bytes = (uint64_t)hdr.count * HMKPM_BATCH_ENTRY_SIZE;
-	if (entries_bytes > U64_MAX - HMKPM_BATCH_HDR_SIZE) { rc = -E2BIG; goto out; }
-	entries_end = HMKPM_BATCH_HDR_SIZE + entries_bytes;
-	if (hdr.data_total > U64_MAX - entries_end) { rc = -E2BIG; goto out; }
-	io_end = entries_end + hdr.data_total;
-	if (write_op) { if (total_len != io_end) { rc = -EINVAL; goto out; } }
-	else { if (total_len < io_end) { rc = -ERANGE; goto out; } }
-
-	kfunc(__rcu_read_lock)();
-	task = kfunc(find_task_by_vpid)((pid_t)hdr.pid);
-	if (!task) { kfunc(__rcu_read_unlock)(); rc = -ESRCH; goto out; }
-	mm = kfunc(get_task_mm)(task);
-	kfunc(__rcu_read_unlock)();
-	if (!mm) { rc = -ESRCH; goto out; }
-
-	data_start = entries_end;
-	while (done < hdr.count) {
-		uint32_t chunk_count = hdr.count - done;
-		uint64_t chunk_bytes;
-		void __user *entry_src;
-		uint32_t i;
-		if (chunk_count > HMKPM_BATCH_CHUNK_ENTRIES) chunk_count = HMKPM_BATCH_CHUNK_ENTRIES;
-		chunk_bytes = (uint64_t)chunk_count * HMKPM_BATCH_ENTRY_SIZE;
-		entry_src = (void __user *)((uint8_t __user *)user_ptr + HMKPM_BATCH_HDR_SIZE + (uint64_t)done * HMKPM_BATCH_ENTRY_SIZE);
-		if (hmkpm_copy_from_user((void *)chunk, entry_src, chunk_bytes) != 0) { rc = -EFAULT; goto out_mm; }
-
-		for (i = 0; i < chunk_count; ++i) {
-			struct hmkpm_batch_entry *e = &chunk[i];
-			uint64_t req_size = e->size;
-			void __user *data_ptr;
-			ssize_t ret;
-			if (req_size == 0) continue;
-			if (req_size > HMKPM_MAX_ENTRY_SIZE) { rc = -E2BIG; goto out_mm; }
-			if (req_size > hdr.data_total - data_off) { rc = -EINVAL; goto out_mm; }
-			e->addr = pgt_untag_user_va(e->addr);
-			if (e->addr > U64_MAX - req_size) {
-				e->size = 0;
-				if (!write_op) hmkpm_zero_user((void __user *)((uint8_t __user *)user_ptr + data_start + data_off), req_size);
-				data_off += req_size;
-				continue;
-			}
-			data_ptr = (void __user *)((uint8_t __user *)user_ptr + data_start + data_off);
-			ret = pgt_rw_mm(mm, e->addr, req_size, data_ptr, write_op);
-			if (ret < 0) {
-				e->size = 0;
-				if (!write_op) hmkpm_zero_user(data_ptr, req_size);
-			} else if ((uint64_t)ret < req_size) {
-				e->size = (uint64_t)ret;
-				if (!write_op) hmkpm_zero_user((void __user *)((uintptr_t)data_ptr + ret), req_size - (uint64_t)ret);
-			} else {
-				e->size = req_size;
-			}
-			data_off += req_size;
-		}
-		if (hmkpm_copy_to_user(entry_src, chunk, chunk_bytes) != 0) { rc = -EFAULT; goto out_mm; }
-		done += chunk_count;
-	}
-	if (unlikely(data_off != hdr.data_total)) { rc = -EINVAL; goto out_mm; }
-out_mm:
-	if (mm) { kfunc(mmput)(mm); mm = NULL; }
-out:
-	args->ret = (uint64_t)(long)rc;
-}
-
-static void hmkpm_handle_v2p_batch(hook_fargs3_t *args, void __user *user_ptr, uint64_t total_len)
-{
-	struct hmkpm_v2p_hdr hdr;
-	struct hmkpm_v2p_entry chunk[HMKPM_V2P_CHUNK_ENTRIES];
-	uint64_t entries_bytes, total_req_bytes;
-	uint32_t done = 0;
-	int rc = 0;
-	struct task_struct *task = NULL;
-	struct mm_struct *mm = NULL;
-	uint64_t pgd = 0;
-
-	if (total_len < HMKPM_V2P_HDR_SIZE) { rc = -EINVAL; goto out; }
-	if (hmkpm_copy_from_user(&hdr, user_ptr, HMKPM_V2P_HDR_SIZE) != 0) { rc = -EFAULT; goto out; }
-	if (hdr.count == 0) { rc = 0; goto out; }
-	if (hdr.count > HMKPM_MAX_V2P_ENTRIES) { rc = -E2BIG; goto out; }
-	if (hdr.pid <= 0) { rc = -EINVAL; goto out; }
-
-	entries_bytes = (uint64_t)hdr.count * HMKPM_V2P_ENTRY_SIZE;
-	if (entries_bytes > U64_MAX - HMKPM_V2P_HDR_SIZE) { rc = -E2BIG; goto out; }
-	total_req_bytes = HMKPM_V2P_HDR_SIZE + entries_bytes;
-	if (total_len < total_req_bytes) { rc = -EINVAL; goto out; }
-
-	kfunc(__rcu_read_lock)();
-	task = kfunc(find_task_by_vpid)((pid_t)hdr.pid);
-	if (!task) { kfunc(__rcu_read_unlock)(); rc = -ESRCH; goto out; }
-	mm = kfunc(get_task_mm)(task);
-	kfunc(__rcu_read_unlock)();
-	if (!mm) { rc = -ESRCH; goto out; }
-	if (mm_struct_offset.pgd_offset < 0) { rc = -EINVAL; goto out_mm; }
-
-	if (hmkpm_copy_from_kernel_nofault(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(pgd)) != 0 || !pgd) { rc = -EFAULT; goto out_mm; }
-
-	while (done < hdr.count) {
-		uint32_t chunk_count = hdr.count - done;
-		uint64_t chunk_bytes;
-		void __user *entry_ptr;
-		uint32_t i;
-		if (chunk_count > HMKPM_V2P_CHUNK_ENTRIES) chunk_count = HMKPM_V2P_CHUNK_ENTRIES;
-		chunk_bytes = (uint64_t)chunk_count * HMKPM_V2P_ENTRY_SIZE;
-		entry_ptr = (void __user *)((uint8_t __user *)user_ptr + HMKPM_V2P_HDR_SIZE + (uint64_t)done * HMKPM_V2P_ENTRY_SIZE);
-		if (hmkpm_copy_from_user((void *)chunk, entry_ptr, chunk_bytes) != 0) { rc = -EFAULT; goto out_mm; }
-
-		hmkpm_mmap_read_lock(mm);
-		for (i = 0; i < chunk_count; ++i) {
-			struct hmkpm_v2p_entry *e = &chunk[i];
-			uint64_t va = e->va;
-			uint32_t flags = 0;
-			uint32_t page_sz = 0;
-			uint64_t pa = pgt_pgtable_inspect(pgd, va, &flags, &page_sz);
-			e->pa = pa; e->flags = flags; e->page_size = page_sz;
-		}
-		hmkpm_mmap_read_unlock(mm);
-		if (hmkpm_copy_to_user(entry_ptr, chunk, chunk_bytes) != 0) { rc = -EFAULT; goto out_mm; }
-		done += chunk_count;
-	}
-out_mm:
-	if (mm) { kfunc(mmput)(mm); mm = NULL; }
-out:
-	args->ret = (uint64_t)(long)rc;
-}
-
-static void hmkpm_handle(hook_fargs3_t *args, void *udata)
-{
-	void __user *user_ptr;
-	uint64_t total_len;
-	uint64_t magic = syscall_argn(args, 0);
-	uid_t uid;
-
-	if (likely(!is_hmkpm_magic(magic))) return;
-	if (!READ_ONCE(hook_active)) return;
-	uid = current_uid();
-	if (uid != 0) return;
-	args->skip_origin = 1;
-
-	if (magic == HMKPM_MAGIC) {
-		user_ptr = (void __user *)syscall_argn(args, 1);
-		total_len = syscall_argn(args, 2);
-		if (user_ptr && total_len > 0) {
-			if (hmkpm_user_range_ok(user_ptr, total_len)) {
-				struct hmkpm_version_info info;
-				kfunc(memset)(&info, 0, sizeof(info));
-				info.magic = HMKPM_MAGIC;
-				info.version_code = HMKPM_VERSION_CODE;
-				info.version_major = HMKPM_VERSION_MAJOR;
-				info.version_minor = HMKPM_VERSION_MINOR;
-				info.version_patch = HMKPM_VERSION_PATCH;
-				info.is_lockless = hmkpm_is_lockless() ? 1 : 0;
-				info.mmap_lock_offset = mmap_lock_sem_offset;
-				info.features = hmkpm_get_active_features();
-				const char *vstr = HMKPM_VERSION_STR;
-				size_t vlen = 0;
-				while (vstr[vlen] && vlen < sizeof(info.version_str) - 1) { info.version_str[vlen] = vstr[vlen]; vlen++; }
-				info.version_str[vlen] = '\0';
-				int copy_rc = 0;
-				if (total_len >= sizeof(struct hmkpm_version_info)) copy_rc = hmkpm_copy_to_user(user_ptr, &info, sizeof(info));
-				else if (total_len >= sizeof(uint32_t)) copy_rc = hmkpm_copy_to_user(user_ptr, &info.version_code, sizeof(uint32_t));
-				if (copy_rc != 0) { args->ret = (uint64_t)(long)-EFAULT; return; }
-			}
-		}
-		args->ret = (((uint64_t)HMKPM_VERSION_CODE << 40) | (HMKPM_MAGIC & 0xFFFFFFFFFFULL));
-		return;
-	}
-
-	user_ptr = (void __user *)syscall_argn(args, 1);
-	total_len = syscall_argn(args, 2);
-	if (total_len == 0) { args->ret = (uint64_t)(long)-EINVAL; return; }
-	if (unlikely(!hmkpm_user_range_ok(user_ptr, total_len))) { args->ret = (uint64_t)(long)-EINVAL; return; }
-
-	if (magic == HMKPM_MAGIC_READ || magic == HMKPM_MAGIC_WRITE) { hmkpm_handle_single(args, user_ptr, total_len, magic); return; }
-	if (magic == HMKPM_MAGIC_READ_BATCH || magic == HMKPM_MAGIC_WRITE_BATCH) { hmkpm_handle_batch(args, user_ptr, total_len, magic); return; }
-	if (magic == HMKPM_MAGIC_V2P_BATCH) { hmkpm_handle_v2p_batch(args, user_ptr, total_len); return; }
-	args->ret = (uint64_t)(long)-EINVAL;
-}
-
-static inline int get_mm_mmap_lock_offset(void)
-{
-	if (kver >= VERSION(6, 12, 0)) return 136;
-	else if (kver >= VERSION(6, 6, 0)) return 144;
-	else if (kver >= VERSION(6, 1, 0)) return 96;
-	else if (kver >= VERSION(5, 15, 0)) return 104;
-	else if (kver >= VERSION(5, 10, 0)) return 112;
-	else return -1;
-}
-
-// ========== Netlink 通信层插入 ==========
+// ========== Netlink 通信层 ==========
 struct sock;
 struct sk_buff;
 struct nlmsghdr {
@@ -1059,10 +715,20 @@ static int netlink_init(void) {
         hmkpm_error("Netlink create failed on proto 31\n");
         return -1;
     }
-    hmkpm_info("Netlink registered on 31\n");
+    hmkpm_info("Netlink registered on proto 31\n");
     return 0;
 }
 // ========== Netlink 层结束 ==========
+
+static inline int get_mm_mmap_lock_offset(void)
+{
+	if (kver >= VERSION(6, 12, 0)) return 136;
+	else if (kver >= VERSION(6, 6, 0)) return 144;
+	else if (kver >= VERSION(6, 1, 0)) return 96;
+	else if (kver >= VERSION(5, 15, 0)) return 104;
+	else if (kver >= VERSION(5, 10, 0)) return 112;
+	else return -1;
+}
 
 static long module_init_handler(const char *args, const char *event, void *__user reserved)
 {
@@ -1115,6 +781,7 @@ static long module_init_handler(const char *args, const char *event, void *__use
 	mmap_lock_sem_offset = get_mm_mmap_lock_offset();
 	if (init_error) return -ENOENT;
 
+    // 原先的 syscall hook 彻底删除，只保留 fsnotify (原版有一部分逻辑，留着保平安)
     if (kver >= VERSION(5, 10, 0)) {
 		fsnotify_addr = hmkpm_lookup_symbol("fsnotify");
 		if (fsnotify_addr) {
@@ -1123,12 +790,10 @@ static long module_init_handler(const char *args, const char *event, void *__use
 		}
 	}
 
-	err = hook_syscalln(__NR_getresuid, 3, (void *)hmkpm_handle, 0, 0);
-	if (err) return -ENOENT;
-
-    // 偷偷注册 Netlink，即使这里失败也不影响模块加载成功
+    // 只启动 Netlink
     if (netlink_init() != 0) {
-        hmkpm_warn("Netlink init failed, but KPM loaded via Syscall hook.\n");
+        hmkpm_error("Netlink init failed\n");
+        return -ENOENT;
     }
 
 	hmkpm_info("module loaded successfully\n");
@@ -1147,7 +812,6 @@ static long module_cleanup_handler(void *__user reserved)
 		hook_unwrap((void *)fsnotify_addr, before_fsnotify, 0);
 		fsnotify_hooked = false;
 	}
-	unhook_syscalln(__NR_getresuid, (void *)hmkpm_handle, 0);
     if (g_nl_sk && hmkpm_lookup_symbol("netlink_kernel_release")) {
         void (*release_nl)(struct sock*) = (void*)hmkpm_lookup_symbol("netlink_kernel_release");
         release_nl(g_nl_sk);
