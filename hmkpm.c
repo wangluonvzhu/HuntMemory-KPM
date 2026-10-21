@@ -526,15 +526,26 @@ static int hmkpm_strstr(const char *haystack, const char *needle) {
 
 static void netlink_recv(struct sk_buff *skb) {
     if (!skb) return;
-    char *skb_data = NULL;
-    if (hmkpm_copy_from_kernel_nofault(&skb_data, (char*)skb + 0xD8, 8) != 0 || !skb_data) return;
+    
+    // ★ 1. 看看有没有收到消息
+    hmkpm_info("=== netlink_recv triggered! ===\n");
 
+    char *skb_data = NULL;
+    // 如果这里报错，说明 sk_buff 的 0xD8 偏移不对
+    if (hmkpm_copy_from_kernel_nofault(&skb_data, (char*)skb + 0xD8, 8) != 0 || !skb_data) {
+        hmkpm_error("Failed to read skb_data at 0xD8!\n");
+        return;
+    }
+    
     struct nlmsghdr *nlh = (struct nlmsghdr *)skb_data;
     if (nlh->nlmsg_len < sizeof(struct hmkpm_nl_req)) return;
 
     struct hmkpm_nl_req *req = (struct hmkpm_nl_req *)NLMSG_DATA(nlh);
     uint32_t user_pid = nlh->nlmsg_pid;
     uint64_t result = 0;
+
+    // ★ 2. 看看收到的命令是什么
+    hmkpm_info("Received cmd: 0x%X\n", nlh->nlmsg_type);
 
     if (nlh->nlmsg_type == HMKPM_NL_CMD_READ) {
         if (req->pid > 0) {
@@ -544,6 +555,7 @@ static void netlink_recv(struct sk_buff *skb) {
         }
     } 
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_PID) {
+        hmkpm_info("Start GET_PID, searching: %s\n", req->pkg_name);
         for (int i = 1; i < 32768; i++) {
             struct task_struct *task = NULL;
             struct mm_struct *mm = NULL;
@@ -553,14 +565,18 @@ static void netlink_recv(struct sk_buff *skb) {
             kfunc(__rcu_read_unlock)();
 
             if (mm) {
-                // ★ 核心改动：读 mm->arg_start (0x2B0)
                 uint64_t arg_start = 0;
+                // ★ 3. 验证 0x2B0 偏移是否能读出有效地址
                 hmkpm_copy_from_kernel_nofault(&arg_start, (const void *)((uintptr_t)mm + 0x2B0), 8);
                 if (arg_start) {
                     char kbuf[128] = {0};
-                    // 用 pgt_rw 读目标进程用户态内存
                     if (pgt_rw(i, arg_start, 127, (void __user *)kbuf, false) > 0) {
+                        // ★ 4. 把读到的字符串打印出来看看！
+                        // 如果这里刷屏的全是乱码，说明 0x2B0 彻底错了
+                        hmkpm_info("PID %d argv: %s\n", i, kbuf);
+                        
                         if (hmkpm_strstr(kbuf, req->pkg_name)) {
+                            hmkpm_info("!!! Found target PID: %d !!!\n", i);
                             result = (uint64_t)i;
                             kfunc(mmput)(mm);
                             break;
@@ -572,6 +588,7 @@ static void netlink_recv(struct sk_buff *skb) {
         }
     }
     else if (nlh->nlmsg_type == HMKPM_NL_CMD_GET_BASE) {
+        hmkpm_info("Start GET_BASE for PID: %d, mod: %s\n", req->pid, req->mod_name);
         struct task_struct *task = NULL; struct mm_struct *mm = NULL;
         kfunc(__rcu_read_lock)(); 
         task = kfunc(find_task_by_vpid)(req->pid);
@@ -581,7 +598,13 @@ static void netlink_recv(struct sk_buff *skb) {
         if (mm) {
             uintptr_t vma = 0;
             hmkpm_copy_from_kernel_nofault(&vma, (const void *)((uintptr_t)mm + 0x000), 8);
-            while (vma) {
+            
+            // ★ 5. 验证 mm+0x000 是否读到了 vma 链表头
+            hmkpm_info("First VMA addr: 0x%lX\n", vma);
+
+            int count = 0;
+            while (vma && count < 500) { // 加个限制防止死循环
+                count++;
                 uintptr_t file = 0;
                 hmkpm_copy_from_kernel_nofault(&file, (const void *)(vma + 0x0A0), 8); // vm_file
                 if (file) {
@@ -590,8 +613,16 @@ static void netlink_recv(struct sk_buff *skb) {
                     if (dentry) {
                         char iname[32] = {0};
                         hmkpm_copy_from_kernel_nofault(iname, (const void *)(dentry + 0x038), 31); // d_iname
+                        
+                        // ★ 6. 打印遍历到的 .so 名字
+                        // 如果找不到 libunity.so 或者打印乱码，说明 0xA0 或 0x38 错了
+                        if (iname[0] != '\0') {
+                            hmkpm_info("VMA[%d] name: %s\n", count, iname);
+                        }
+
                         if (hmkpm_strstr(iname, req->mod_name)) { 
                             hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + 0x000), 8); // vm_start
+                            hmkpm_info("!!! Found %s: 0x%lX !!!\n", req->mod_name, result);
                             break; 
                         }
                     }
@@ -603,6 +634,9 @@ static void netlink_recv(struct sk_buff *skb) {
             kfunc(mmput)(mm);
         }
     }
+
+    // ★ 7. 打印最终返回给用户端的结果
+    hmkpm_info("Result: 0x%lX\n", result);
 
     if (kf_alloc_skb && kf_netlink_unicast && kf_skb_put) {
         struct sk_buff *skb_out = kf_alloc_skb(64, 0); 
