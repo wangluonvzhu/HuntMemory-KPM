@@ -14,9 +14,10 @@
 #include <linux/mm_types.h>
 #include <linux/sched.h>
 #include <linux/printk.h>
+#include <linux/string.h>
 #include <asm-generic/rwonce.h>
 
-#define HMKPM_VERSION_STR "3.0.0-netlink"
+#define HMKPM_VERSION_STR "3.0.1-netlink"
 
 KPM_NAME("HMKPM");
 KPM_VERSION(HMKPM_VERSION_STR);
@@ -81,12 +82,11 @@ static inline long hmkpm_read_kernel(void *dst, const void *src, size_t size) {
 // ============================================================
 // 页表遍历核心
 // ============================================================
-static uint64_t pgt_va_bits, pgt_phys_offset, pgt_page_offset, pgt_linear_voffset;
+static uint64_t pgt_va_bits, pgt_page_offset, pgt_linear_voffset;
 static uint64_t pgt_page_shift, pgt_page_size, pgt_pgd_align_mask, pgt_pgd_size;
 static uint64_t pgt_page_level, pgt_high_memory;
 
 static inline uint64_t pgt_phys_to_virt(uint64_t phys) { return phys + pgt_linear_voffset; }
-static inline uint64_t pgt_virt_to_phys(uint64_t addr) { return addr - pgt_linear_voffset; }
 
 static inline uint64_t pgt_desc_to_phys(uint64_t desc) {
     return desc & (((1ULL << (48 - pgt_page_shift)) - 1) << pgt_page_shift);
@@ -100,7 +100,6 @@ static uint64_t pgt_walk(uint64_t pgd, uint64_t va) {
     va &= 0x00FFFFFFFFFFFFFFULL; // TBI untag
 
     for (int64_t lv = start; lv < 4; lv++) {
-        uint64_t cur_size = (lv == start) ? pgt_pgd_size : pgt_page_size;
         if (table_va < pgt_page_offset || table_va >= pgt_high_memory) return 0;
 
         uint64_t pxd_shift = pxd_bits * (4 - lv) + 3;
@@ -146,17 +145,16 @@ static int pgt_init(void) {
     uint64_t va1_bits = 64 - ((tcr_el1 >> 16) & 0x3F);
     pgt_page_offset = -(UL(1) << va1_bits);
 
-    if (!hmkpm_lookup_symbol("memstart_addr") || !hmkpm_lookup_symbol("high_memory")) {
+    unsigned long ms_addr = hmkpm_lookup_symbol("memstart_addr");
+    unsigned long hm_addr = hmkpm_lookup_symbol("high_memory");
+    if (!ms_addr || !hm_addr) {
         hmkpm_error("memstart_addr or high_memory not found\n");
         return -1;
     }
-    kvar_memstart_addr = (u64*)hmkpm_lookup_symbol("memstart_addr");
-    kvar_high_memory = (void**)hmkpm_lookup_symbol("high_memory");
     
-    // 在KPM里直接取值可能出问题，用 probe_kernel_read 安全读取
     uint64_t ms = 0, hm = 0;
-    kfunc(probe_kernel_read)(&ms, kvar_memstart_addr, 8);
-    kfunc(probe_kernel_read)(&hm, kvar_high_memory, 8);
+    kfunc(probe_kernel_read)(&ms, (void*)ms_addr, 8);
+    kfunc(probe_kernel_read)(&hm, (void*)hm_addr, 8);
 
     pgt_linear_voffset = pgt_page_offset - ms;
     pgt_high_memory = hm;
@@ -184,7 +182,6 @@ struct hmkpm_req {
 static void netlink_recv(struct sk_buff *skb) {
     if (!skb) return;
     
-    // 5.10 sk_buff->data 偏移通常是 0xD8，直接用 probe_kernel_read 读
     char *skb_data = NULL;
     if (kfunc(probe_kernel_read)(&skb_data, (char*)skb + 0xD8, 8) != 0 || !skb_data) return;
 
@@ -194,7 +191,6 @@ static void netlink_recv(struct sk_buff *skb) {
     struct hmkpm_req *req = (struct hmkpm_req *)NLMSG_DATA(nlh);
     uint32_t user_pid = nlh->nlmsg_pid;
 
-    // 执行读取
     long ret = -1;
     if (req->pid > 0) {
         kfunc(__rcu_read_lock)();
@@ -216,7 +212,6 @@ static void netlink_recv(struct sk_buff *skb) {
         }
     }
 
-    // 回包告诉用户态状态
     if (kf_alloc_skb && kf_netlink_unicast && kf_skb_put) {
         struct sk_buff *skb_out = kf_alloc_skb(32, 0); // GFP_ATOMIC
         if (skb_out) {
@@ -246,7 +241,6 @@ static int netlink_init(void) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.input = netlink_recv;
 
-    // 直接使用 31 号协议，不用循环了
     g_nl_sk = kf_netlink_create(kv_init_net, 31, NULL, &cfg);
     if (!g_nl_sk) {
         hmkpm_error("Netlink create failed on proto 31\n");
@@ -263,7 +257,6 @@ static int netlink_init(void) {
 static long module_init_handler(const char *args, const char *event, void *__user reserved) {
     hmkpm_info("Module init started\n");
 
-    // 1. 查基础符号
     kf_memset = (void*)hmkpm_lookup_symbol("memset");
     kf___arch_copy_to_user = (void*)hmkpm_lookup_symbol("__arch_copy_to_user");
     kf_probe_kernel_read = (void*)hmkpm_lookup_symbol("probe_kernel_read");
@@ -278,13 +271,11 @@ static long module_init_handler(const char *args, const char *event, void *__use
         return -1;
     }
 
-    // 2. 页表初始化
     if (pgt_init() != 0) {
         hmkpm_error("Pgt init failed\n");
         return -1;
     }
 
-    // 3. Netlink 初始化
     if (netlink_init() != 0) {
         hmkpm_error("Netlink init failed\n");
         return -1;
