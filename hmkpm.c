@@ -64,6 +64,37 @@ void kfunc_def(__rcu_read_unlock)(void);
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
 
+/* 内部字符串匹配函数 (必须放在使用前) */
+static int hmkpm_strstr_inline(const char *haystack, const char *needle) {
+    if (!*needle) return 1;
+    for (; *haystack; ++haystack) {
+        const char *h = haystack; const char *n = needle;
+        while (*h && *n && *h == *n) { h++; n++; }
+        if (!*n) return 1;
+    }
+    return 0;
+}
+
+/* 符号查找宏 */
+static unsigned long hmkpm_lookup_symbol(const char *name) {
+    if (!name || !kallsyms_lookup_name) return 0;
+    return kallsyms_lookup_name(name);
+}
+
+#define hkfunc_match(func) \
+do { \
+    kf_##func = (typeof(kf_##func))hmkpm_lookup_symbol(#func); \
+    if (!kf_##func) { hmkpm_error("Missing kfunc %s\n", #func); return -ENOENT; } \
+} while (0)
+
+#define hkvar_match(var) \
+do { \
+    kv_##var = (typeof(kv_##var))hmkpm_lookup_symbol(#var); \
+    if (!kv_##var) { hmkpm_error("Missing kvar %s\n", #var); init_error = true; } \
+} while (0)
+
+static bool init_error = false;
+
 /* 内存拷贝封装 */
 static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, size_t size) {
     if (!src || !dst) return -EINVAL;
@@ -79,18 +110,6 @@ static inline unsigned long hmkpm_copy_from_user(void *to, const void __user *fr
 static inline unsigned long hmkpm_copy_to_user(void __user *to, const void *from, unsigned long n) {
     return kfunc(__arch_copy_to_user)(to, from, n);
 }
-
-/* 符号查找 */
-static unsigned long hmkpm_lookup_symbol(const char *name) {
-    if (!name || !kallsyms_lookup_name) return 0;
-    return kallsyms_lookup_name(name);
-}
-
-#define hkfunc_match(func) \
-do { \
-    kf_##func = (typeof(kf_##func))hmkpm_lookup_symbol(#func); \
-    if (!kf_##func) { hmkpm_error("Missing kfunc %s\n", #func); return -ENOENT; } \
-} while (0)
 
 /* 页表配置 */
 static uint64_t pgt_va_bits, pgt_phys_offset, pgt_page_offset, pgt_linear_voffset;
@@ -120,11 +139,16 @@ static int pgt_init(void) {
     else pgt_page_offset = -(1ULL << va1_bits);
 
     hkvar_match(memstart_addr);
+    if (!kv_memstart_addr) return -EFAULT;
     pgt_phys_offset = kvar_val(memstart_addr);
     pgt_linear_voffset = pgt_page_offset - pgt_phys_offset;
 
     hkvar_match(high_memory);
-    pgt_high_memory = (uint64_t)kvar_val(high_memory);
+    if (kv_high_memory) {
+        pgt_high_memory = (uint64_t)kvar_val(high_memory);
+    } else {
+        pgt_high_memory = ~0ULL;
+    }
 
     return 0;
 }
@@ -274,17 +298,6 @@ static uint64_t kernel_get_base(int pid, const char *mod_name) {
     return result;
 }
 
-/* 内部字符串匹配函数 */
-static int hmkpm_strstr_inline(const char *haystack, const char *needle) {
-    if (!*needle) return 1;
-    for (; *haystack; ++haystack) {
-        const char *h = haystack; const char *n = needle;
-        while (*h && *n && *h == *n) { h++; n++; }
-        if (!*n) return 1;
-    }
-    return 0;
-}
-
 /* 劫持 read 系统调用 */
 #define HMKPM_TRIGGER_FD 0x48534B50
 
@@ -334,7 +347,6 @@ static long module_init_handler(const char *args, const char *event, void *__use
     if (read_sys) {
         orig_read = (void*)read_sys;
         // 在内核里直接替换，无需 Hook 框架，这是最高效隐蔽的做法
-        // 注意：为了安全起见，这里使用 KPatch 的 hook_wrap 机制
         hook_err_t err = hook_wrap3((void *)read_sys, (void *)fake_read, 0, 0);
         if (err) {
             hmkpm_error("Hook read failed: %d\n", err);
