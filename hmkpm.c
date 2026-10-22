@@ -4,6 +4,7 @@
  *
  * KernelPatch Module (KPM) - [HMKPM]
  * Read-only build with Netlink 31 channel (Anti-ACE optimized)
+ * Target OS: Android GKI 5.10.x
  */
 
 #include <asm/current.h>
@@ -56,6 +57,15 @@ struct inode;
 #define hmkpm_info(fmt, ...)        logki(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_warn(fmt, ...)        logkw(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_error(fmt, ...)       logke(HMKPM_TAG fmt, ##__VA_ARGS__)
+
+/* 内核 5.10 结构体偏移定义 */
+#define MM_MMAP_OFFSET       0x00
+#define MM_ARG_START_OFFSET  0x130
+#define VMA_VM_START_OFFSET  0x00
+#define VMA_VM_FILE_OFFSET   0x80
+#define VMA_VM_NEXT_OFFSET   0xA0
+#define FILE_F_PATH_DENTRY_OFFSET 0x18
+#define DENTRY_D_NAME_NAME_OFFSET 0x38
 
 void *memset(void *s, int c, size_t count)
 {
@@ -296,7 +306,9 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write)
 {
 	uint64_t table_va, pxd_bits, pxd_ptrs;
 	int64_t start, lv;
-	if (!pgd || (pgd & pgt_pgd_align_mask) || validate_virt_range(pgd, pgt_pgd_size)) return 0;
+	
+    // 【修复点】：去掉对 pgd 的 validate_virt_range 检查，它是内核地址
+	if (!pgd || (pgd & pgt_pgd_align_mask)) return 0;
 	va = pgt_untag_user_va(va);
 	if (va >> pgt_va_bits) return 0;
 
@@ -308,7 +320,8 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write)
 	for (lv = start; lv < 4; lv++) {
 		uint64_t pxd_shift, pxd_index, top_bits, entry_va, desc = 0, type;
 		uint64_t cur_table_size = (lv == start) ? pgt_pgd_size : pgt_page_size;
-		if (validate_virt_range(table_va, cur_table_size)) return 0;
+		
+        if (validate_virt_range(table_va, cur_table_size)) return 0;
 
 		pxd_shift = (pgt_page_shift - 3) * (4 - lv) + 3;
 		if (pxd_shift >= pgt_va_bits) return 0;
@@ -391,8 +404,9 @@ static int pgt_pgtable_init(void)
 	} else { pgt_pgd_size = pgt_page_size; pgt_pgd_align_mask = pgt_page_size - 1; }
 
 	if (kver >= VERSION(5, 4, 0)) { pgt_pgd_size = pgt_page_size; pgt_pgd_align_mask = pgt_page_size - 1; }
-	if (kver >= VERSION(5, 4, 0)) pgt_page_offset = -(UL(1) << va1_bits);
-	else if (kver >= VERSION(4, 6, 0)) pgt_page_offset = -(UL(1) << (va1_bits - 1));
+
+    // 【修复点】：5.10 内核 PAGE_OFFSET 计算修正，必须 -1
+	if (kver >= VERSION(4, 6, 0)) pgt_page_offset = -(UL(1) << (va1_bits - 1));
 	else pgt_page_offset = -(UL(1) << va1_bits);
 
 	hkvar_match(memstart_addr);
@@ -438,8 +452,8 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 	uint64_t pgd = 0;
 	uint8_t bounce[HMKPM_BOUNCE_SIZE];
 
-	if (!mm || is_write) return -EOPNOTSUPP; // 纯只读
-	if (mm_struct_offset.pgd_offset < 0) return -EINVAL;
+	if (!mm || is_write) return -EOPNOTSUPP; 
+	if (mm_struct_offset.pgd_offset <= 0) return -EINVAL;
 
 	if (hmkpm_copy_from_kernel_nofault(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(pgd)) != 0 || !pgd)
 		return -EFAULT;
@@ -486,7 +500,7 @@ static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len, void *local_buf
 }
 
 // ==========================================
-// Netlink 通信层 (由你提供的代码移植)
+// Netlink 通信层
 // ==========================================
 struct nlmsghdr { uint32_t nlmsg_len; uint16_t nlmsg_type; uint16_t nlmsg_flags; uint32_t nlmsg_seq; uint32_t nlmsg_pid; };
 #define NLMSG_HDRLEN ((int)((sizeof(struct nlmsghdr)+3)&~3))
@@ -513,11 +527,8 @@ static int hmkpm_strstr(const char *haystack, const char *needle) {
 static void netlink_recv(struct sk_buff *skb) {
     if (!skb || !g_nl_sk) return;
 
-    // 提取 skb->data (动态拉取，避免硬编码 0xD8 偏移崩溃)
     char *skb_data = NULL;
     if (kf_skb_pull) {
-        // 为了不影响原有 skb 状态，我们调用 pull 然后原样放回，仅获取当前 data 指针
-        // 更好的做法是直接解析 skb 结构偏移，但用 pull(0) 是安全的
         skb_data = kf_skb_pull(skb, 0); 
     }
     if (!skb_data) return;
@@ -547,7 +558,8 @@ static void netlink_recv(struct sk_buff *skb) {
 
             if (mm) {
                 uint64_t arg_start = 0;
-                hmkpm_copy_from_kernel_nofault(&arg_start, (const void *)((uintptr_t)mm + 0x130), 8);
+                // MM_ARG_START_OFFSET = 0x130 (5.10 GKI)
+                hmkpm_copy_from_kernel_nofault(&arg_start, (const void *)((uintptr_t)mm + MM_ARG_START_OFFSET), 8);
                 if (arg_start) {
                     char kbuf[128] = {0};
                     if (pgt_rw(i, arg_start, 127, (void *)kbuf, false) > 0) {
@@ -571,28 +583,38 @@ static void netlink_recv(struct sk_buff *skb) {
 
         if (mm) {
             uintptr_t vma = 0;
-            hmkpm_copy_from_kernel_nofault(&vma, (const void *)((uintptr_t)mm + 0x00), 8);
+            // MM_MMAP_OFFSET = 0x00 (5.10 GKI)
+            hmkpm_copy_from_kernel_nofault(&vma, (const void *)((uintptr_t)mm + MM_MMAP_OFFSET), 8);
             
             while (vma) {
                 uintptr_t file = 0;
-                hmkpm_copy_from_kernel_nofault(&file, (const void *)(vma + 0xA0), 8);
+                // VMA_VM_FILE_OFFSET = 0x80 (5.10 GKI)
+                hmkpm_copy_from_kernel_nofault(&file, (const void *)(vma + VMA_VM_FILE_OFFSET), 8);
                 
                 if (file) {
                     uintptr_t dentry = 0;
-                    hmkpm_copy_from_kernel_nofault(&dentry, (const void *)(file + 0x20), 8);
+                    // FILE_F_PATH_DENTRY_OFFSET = 0x18 (5.10 GKI)
+                    hmkpm_copy_from_kernel_nofault(&dentry, (const void *)(file + FILE_F_PATH_DENTRY_OFFSET), 8);
                     
                     if (dentry) {
-                        char iname[32] = {0};
-                        hmkpm_copy_from_kernel_nofault(iname, (const void *)(dentry + 0x38), 31);
+                        char *name_ptr = NULL;
+                        // DENTRY_D_NAME_NAME_OFFSET = 0x38 (5.10 GKI)
+                        hmkpm_copy_from_kernel_nofault(&name_ptr, (const void *)(dentry + DENTRY_D_NAME_NAME_OFFSET), 8);
                         
-                        if (hmkpm_strstr(iname, req->mod_name)) { 
-                            hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + 0x00), 8);
-                            break; 
+                        if (name_ptr) {
+                            char iname[64] = {0};
+                            hmkpm_copy_from_kernel_nofault(iname, name_ptr, 63);
+                            if (hmkpm_strstr(iname, req->mod_name)) { 
+                                // VMA_VM_START_OFFSET = 0x00
+                                hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + VMA_VM_START_OFFSET), 8);
+                                break; 
+                            }
                         }
                     }
                 }
                 uintptr_t next_vma = 0;
-                hmkpm_copy_from_kernel_nofault(&next_vma, (const void *)(vma + 0x08), 8);
+                // VMA_VM_NEXT_OFFSET = 0xA0 (5.10 GKI) 
+                hmkpm_copy_from_kernel_nofault(&next_vma, (const void *)(vma + VMA_VM_NEXT_OFFSET), 8);
                 vma = next_vma;
             }
             kfunc(mmput)(mm);
