@@ -18,26 +18,27 @@
 #include <uapi/asm-generic/unistd.h>
 #include <asm-generic/rwonce.h>
 
+#define HMKPM_VERSION_STR "3.0.0-silent"
+
 KPM_NAME("HMKPM");
-KPM_VERSION("3.0.0-silent");
+KPM_VERSION(HMKPM_VERSION_STR);
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
-KPM_DESCRIPTION("Fully kernel-side memory reader");
+KPM_DESCRIPTION("KernelPatch Module (KPM) HMKPM - Silent Read Channel");
 
 #define HMKPM_TAG "[HMKPM] "
 #define hmkpm_info(fmt, ...) logki(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_error(fmt, ...) logke(HMKPM_TAG fmt, ##__VA_ARGS__)
 
-/* 5.10 GKI 结构体偏移 */
+/* 适配 Android GKI 5.10 结构体偏移 */
 #define MM_MMAP_OFFSET       0x00
-#define MM_ARG_START_OFFSET  0x130
 #define VMA_VM_START_OFFSET  0x00
 #define VMA_VM_FILE_OFFSET   0x80
 #define VMA_VM_NEXT_OFFSET   0xA0
 #define FILE_F_PATH_DENTRY_OFFSET 0x18
 #define DENTRY_D_NAME_NAME_OFFSET 0x38
 
-/* 通信协议 */
+/* 通信协议结构 (与用户态严格一致) */
 struct hmkpm_cmd {
     uint32_t cmd;      // 1=GET_PID, 2=GET_BASE, 3=READ
     int32_t pid;       // 目标 PID
@@ -47,13 +48,10 @@ struct hmkpm_cmd {
     char name[64];     // 包名或模块名
 };
 
-void *memset(void *s, int c, size_t count)
-{
-    unsigned char *p = (unsigned char *)s;
-    while (count--) *p++ = (unsigned char)c;
-    return s;
-}
-
+/* KPM 内部函数声明 */
+void *kfunc_def(memset)(void *s, int c, size_t count);
+unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
+unsigned long kfunc_def(__arch_copy_from_user)(void *to, const void __user *from, unsigned long n);
 long kfunc_def(probe_kernel_read)(void *dst, const void *src, size_t size);
 long kfunc_def(copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
 struct task_struct *kfunc_def(find_task_by_vpid)(pid_t pid);
@@ -61,9 +59,12 @@ struct mm_struct *kfunc_def(get_task_mm)(struct task_struct *task);
 void kfunc_def(mmput)(struct mm_struct *mm);
 void kfunc_def(__rcu_read_lock)(void);
 void kfunc_def(__rcu_read_unlock)(void);
+
+/* KPM 内部变量声明 */
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
 
+/* 内存拷贝封装 */
 static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, size_t size) {
     if (!src || !dst) return -EINVAL;
     if (kf_copy_from_kernel_nofault) return kfunc(copy_from_kernel_nofault)(dst, src, size);
@@ -71,12 +72,27 @@ static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, si
     return -ENOSYS;
 }
 
+static inline unsigned long hmkpm_copy_from_user(void *to, const void __user *from, unsigned long n) {
+    return kfunc(__arch_copy_from_user)(to, from, n);
+}
+
+static inline unsigned long hmkpm_copy_to_user(void __user *to, const void *from, unsigned long n) {
+    return kfunc(__arch_copy_to_user)(to, from, n);
+}
+
+/* 符号查找 */
 static unsigned long hmkpm_lookup_symbol(const char *name) {
     if (!name || !kallsyms_lookup_name) return 0;
     return kallsyms_lookup_name(name);
 }
 
-/* 页表配置与安全转换 */
+#define hkfunc_match(func) \
+do { \
+    kf_##func = (typeof(kf_##func))hmkpm_lookup_symbol(#func); \
+    if (!kf_##func) { hmkpm_error("Missing kfunc %s\n", #func); return -ENOENT; } \
+} while (0)
+
+/* 页表配置 */
 static uint64_t pgt_va_bits, pgt_phys_offset, pgt_page_offset, pgt_linear_voffset;
 static uint64_t pgt_page_shift, pgt_page_size, pgt_pgd_align_mask, pgt_pgd_size;
 static uint64_t pgt_page_level, pgt_user_limit, pgt_high_memory;
@@ -103,13 +119,12 @@ static int pgt_init(void) {
     if (kver >= VERSION(4, 6, 0)) pgt_page_offset = -(1ULL << (va1_bits - 1));
     else pgt_page_offset = -(1ULL << va1_bits);
 
-    unsigned long m_addr = hmkpm_lookup_symbol("memstart_addr");
-    if (m_addr) pgt_phys_offset = *(u64 *)m_addr;
+    hkvar_match(memstart_addr);
+    pgt_phys_offset = kvar_val(memstart_addr);
     pgt_linear_voffset = pgt_page_offset - pgt_phys_offset;
 
-    unsigned long h_mem = hmkpm_lookup_symbol("high_memory");
-    if (h_mem) pgt_high_memory = *(uint64_t *)h_mem;
-    else pgt_high_memory = ~0ULL;
+    hkvar_match(high_memory);
+    pgt_high_memory = (uint64_t)kvar_val(high_memory);
 
     return 0;
 }
@@ -119,6 +134,7 @@ static inline uint64_t pgt_desc_to_phys(uint64_t desc) {
     return desc & (((1ULL << (48 - pgt_page_shift)) - 1) << pgt_page_shift);
 }
 
+/* 绝对防崩溃的页表遍历 */
 static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va) {
     uint64_t table_va, pxd_bits, pxd_ptrs, desc, type, base;
     int64_t start, lv;
@@ -158,15 +174,18 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va) {
     return 0;
 }
 
-/* 【绝对安全的内存读取】 */
+/* 读进程内存 */
 static ssize_t safe_read_memory(pid_t pid, uint64_t remote_va, void *local_buf, size_t len) {
-    struct task_struct *task; struct mm_struct *mm; uint64_t pgd = 0;
+    struct task_struct *task = NULL; 
+    struct mm_struct *mm = NULL; 
+    uint64_t pgd = 0;
     ssize_t total = 0;
 
     kfunc(__rcu_read_lock)();
     task = kfunc(find_task_by_vpid)(pid);
     if (task) mm = kfunc(get_task_mm)(task);
     kfunc(__rcu_read_unlock)();
+    
     if (!mm) return -ESRCH;
 
     if (hmkpm_copy_from_kernel_nofault(&pgd, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), 8) != 0 || !pgd) {
@@ -175,21 +194,27 @@ static ssize_t safe_read_memory(pid_t pid, uint64_t remote_va, void *local_buf, 
 
     while (len > 0) {
         uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, remote_va);
-        if (!tkpa) break; // 读失败直接中断，不崩溃
+        if (!tkpa) {
+            if (total > 0) break;
+            kfunc(mmput)(mm); return -EFAULT;
+        }
 
         size_t chunk = pgt_page_size - (remote_va & (pgt_page_size - 1));
         if (chunk > len) chunk = len;
 
         void *tkva = (void *)pgt_phys_to_virt(tkpa);
-        if (hmkpm_copy_from_kernel_nofault((uint8_t*)local_buf + total, tkva, chunk) != 0) break;
+        if (hmkpm_copy_from_kernel_nofault((uint8_t*)local_buf + total, tkva, chunk) != 0) {
+            if (total > 0) break;
+            kfunc(mmput)(mm); return -EFAULT;
+        }
         
         total += chunk; remote_va += chunk; len -= chunk;
     }
     kfunc(mmput)(mm);
-    return (total > 0) ? total : -EFAULT;
+    return total;
 }
 
-/* 全内核找 PID (遍历 comm) */
+/* 遍历找 PID */
 static int kernel_find_pid(const char *pkg_name) {
     for (int i = 1; i < 32768; i++) {
         struct task_struct *task;
@@ -199,7 +224,7 @@ static int kernel_find_pid(const char *pkg_name) {
             char comm[17] = {0};
             // 5.10 GKI task->comm 偏移 0x8C0
             hmkpm_copy_from_kernel_nofault(comm, (const void *)((uintptr_t)task + 0x8C0), 16);
-            if (comm[0] && strstr(comm, pkg_name)) {
+            if (comm[0] && hmkpm_strstr_inline(comm, pkg_name)) {
                 kfunc(__rcu_read_unlock)();
                 return i;
             }
@@ -209,9 +234,10 @@ static int kernel_find_pid(const char *pkg_name) {
     return -1;
 }
 
-/* 全内核找基址 (遍历 VMA) */
+/* 遍历 VMA 找基址 */
 static uint64_t kernel_get_base(int pid, const char *mod_name) {
-    struct task_struct *task; struct mm_struct *mm;
+    struct task_struct *task = NULL; 
+    struct mm_struct *mm = NULL;
     uint64_t result = 0;
 
     kfunc(__rcu_read_lock)();
@@ -234,7 +260,7 @@ static uint64_t kernel_get_base(int pid, const char *mod_name) {
                 if (name_ptr) {
                     char iname[64] = {0};
                     if (hmkpm_copy_from_kernel_nofault(iname, name_ptr, 63) == 0) {
-                        if (strstr(iname, mod_name)) {
+                        if (hmkpm_strstr_inline(iname, mod_name)) {
                             hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + VMA_VM_START_OFFSET), 8);
                             break;
                         }
@@ -248,9 +274,19 @@ static uint64_t kernel_get_base(int pid, const char *mod_name) {
     return result;
 }
 
-/* Hook 通信点：极其普通的 syscall 替换 */
-// 这里用 read 系统调用作为触发点，但不劫持真实文件，而是配合用户层的伪造 fd
-#define HMKPM_TRIGGER_FD 0x48534B50 // 伪装成普通数字
+/* 内部字符串匹配函数 */
+static int hmkpm_strstr_inline(const char *haystack, const char *needle) {
+    if (!*needle) return 1;
+    for (; *haystack; ++haystack) {
+        const char *h = haystack; const char *n = needle;
+        while (*h && *n && *h == *n) { h++; n++; }
+        if (!*n) return 1;
+    }
+    return 0;
+}
+
+/* 劫持 read 系统调用 */
+#define HMKPM_TRIGGER_FD 0x48534B50
 
 long (*orig_read)(unsigned int fd, char __user *buf, size_t count);
 long fake_read(unsigned int fd, char __user *buf, size_t count) {
@@ -259,13 +295,12 @@ long fake_read(unsigned int fd, char __user *buf, size_t count) {
         if (hmkpm_copy_from_user(&cmd, buf, sizeof(cmd)) == 0) {
             uint64_t ret_val = 0;
             if (cmd.cmd == 1) {
-                ret_val = kernel_find_pid(cmd.name);
+                ret_val = (uint64_t)kernel_find_pid(cmd.name);
             } else if (cmd.cmd == 2) {
                 ret_val = kernel_get_base(cmd.pid, cmd.name);
             } else if (cmd.cmd == 3) {
-                ret_val = safe_read_memory(cmd.pid, cmd.addr, (void*)cmd.user_buf, cmd.size);
+                ret_val = (uint64_t)safe_read_memory(cmd.pid, cmd.addr, (void*)cmd.user_buf, cmd.size);
             }
-            // 把返回值直接写回用户态 buffer 的头部
             hmkpm_copy_to_user(buf, &ret_val, sizeof(ret_val));
             return sizeof(ret_val);
         }
@@ -274,27 +309,53 @@ long fake_read(unsigned int fd, char __user *buf, size_t count) {
     return orig_read(fd, buf, count);
 }
 
+/* 模块加载/卸载 */
 static long module_init_handler(const char *args, const char *event, void *__user reserved) {
-    if (pgt_init() != 0) return -ENOENT;
+    if (pgt_init() != 0) {
+        hmkpm_error("Page table init failed\n");
+        return -ENOENT;
+    }
 
-    kf_find_task_by_vpid = (void*)hmkpm_lookup_symbol("find_task_by_vpid");
-    kf_get_task_mm = (void*)hmkpm_lookup_symbol("get_task_mm");
-    kf_mmput = (void*)hmkpm_lookup_symbol("mmput");
-    kf___rcu_read_lock = (void*)hmkpm_lookup_symbol("__rcu_read_lock");
-    kf___rcu_read_unlock = (void*)hmkpm_lookup_symbol("__rcu_read_unlock");
-    kf_copy_from_kernel_nofault = (void*)hmkpm_lookup_symbol("copy_from_kernel_nofault");
-    if (!kf_copy_from_kernel_nofault) kf_probe_kernel_read = (void*)hmkpm_lookup_symbol("probe_kernel_read");
+    hkfunc_match(__arch_copy_to_user);
+    hkfunc_match(__arch_copy_from_user);
+    hkfunc_match(find_task_by_vpid);
+    hkfunc_match(get_task_mm);
+    hkfunc_match(mmput);
+    hkfunc_match(__rcu_read_lock);
+    hkfunc_match(__rcu_read_unlock);
 
-    // Hook read 系统调用
-    hook_err_t err = hook_syscalln(__NR_read, 3, (void *)fake_read, 0, 0);
-    if (err) return -ENOENT;
+    kf_copy_from_kernel_nofault = (typeof(kf_copy_from_kernel_nofault))hmkpm_lookup_symbol("copy_from_kernel_nofault");
+    if (!kf_copy_from_kernel_nofault) hkfunc_match(probe_kernel_read);
+
+    // 获取真实的 read 函数地址
+    unsigned long read_sys = hmkpm_lookup_symbol("__arm64_sys_read");
+    if (!read_sys) read_sys = hmkpm_lookup_symbol("ksys_read");
+    
+    if (read_sys) {
+        orig_read = (void*)read_sys;
+        // 在内核里直接替换，无需 Hook 框架，这是最高效隐蔽的做法
+        // 注意：为了安全起见，这里使用 KPatch 的 hook_wrap 机制
+        hook_err_t err = hook_wrap3((void *)read_sys, (void *)fake_read, 0, 0);
+        if (err) {
+            hmkpm_error("Hook read failed: %d\n", err);
+            return -ENOENT;
+        }
+    } else {
+        hmkpm_error("Failed to find read syscall\n");
+        return -ENOENT;
+    }
 
     hmkpm_info("Fully-Kernel Silent Module Loaded\n");
     return 0;
 }
 
 static long module_cleanup_handler(void *__user reserved) {
-    unhook_syscalln(__NR_read, (void *)fake_read, 0);
+    unsigned long read_sys = hmkpm_lookup_symbol("__arm64_sys_read");
+    if (!read_sys) read_sys = hmkpm_lookup_symbol("ksys_read");
+    if (read_sys) {
+        hook_unwrap((void *)read_sys, (void *)fake_read, 0);
+    }
+    hmkpm_info("Module cleaned up\n");
     return 0;
 }
 
