@@ -28,11 +28,8 @@
 
 #define HMKPM_VERSION_MAJOR	2
 #define HMKPM_VERSION_MINOR	9
-#define HMKPM_VERSION_PATCH	2
-#define HMKPM_VERSION_CODE	(((uint32_t)HMKPM_VERSION_MAJOR << 16) | \
-				 ((uint32_t)HMKPM_VERSION_MINOR << 8) | \
-				 ((uint32_t)HMKPM_VERSION_PATCH))
-#define HMKPM_VERSION_STR	"2.9.2-nl31"
+#define HMKPM_VERSION_PATCH	3
+#define HMKPM_VERSION_STR	"2.9.3-nl31"
 
 KPM_NAME("HMKPM");
 KPM_VERSION(HMKPM_VERSION_STR);
@@ -55,10 +52,9 @@ struct inode;
 #define HMKPM_TAG			"[HMKPM] "
 
 #define hmkpm_info(fmt, ...)        logki(HMKPM_TAG fmt, ##__VA_ARGS__)
-#define hmkpm_warn(fmt, ...)        logkw(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_error(fmt, ...)       logke(HMKPM_TAG fmt, ##__VA_ARGS__)
 
-/* 内核 5.10 结构体偏移定义 */
+/* 适配 5.10 GKI 结构体偏移 */
 #define MM_MMAP_OFFSET       0x00
 #define MM_ARG_START_OFFSET  0x130
 #define VMA_VM_START_OFFSET  0x00
@@ -79,23 +75,15 @@ static inline void make_cfi_name(char *dst, size_t dst_size, const char *name)
 {
 	const char *suffix = ".cfi_jt";
 	size_t i = 0;
-
-	while (name && *name && i + 1 < dst_size)
-		dst[i++] = *name++;
-
-	while (*suffix && i + 1 < dst_size)
-		dst[i++] = *suffix++;
-
+	while (name && *name && i + 1 < dst_size) dst[i++] = *name++;
+	while (*suffix && i + 1 < dst_size) dst[i++] = *suffix++;
 	dst[i] = '\0';
 }
 
 static unsigned long hmkpm_lookup_symbol(const char *name)
 {
 	unsigned long addr;
-
-	if (!name || !kallsyms_lookup_name)
-		return 0;
-
+	if (!name || !kallsyms_lookup_name) return 0;
 	addr = kallsyms_lookup_name(name);
 	if (!addr) {
 		char cfi_name[64];
@@ -179,6 +167,7 @@ static void before_fsnotify(hook_fargs7_t *args, void *udata)
 
 static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, size_t size)
 {
+	if (!src || !dst) return -EINVAL;
 	if (kf_copy_from_kernel_nofault) return kfunc(copy_from_kernel_nofault)(dst, src, size);
 	if (kf_probe_kernel_read) return kfunc(probe_kernel_read)(dst, src, size);
 	return -ENOSYS;
@@ -231,7 +220,7 @@ static inline uint64_t hmkpm_uaccess_enable(void)
 				mm = kfunc(get_task_mm)(cur);
 				need_mmput = true;
 			}
-			if (mm && mm_struct_offset.pgd_offset >= 0) {
+			if (mm && mm_struct_offset.pgd_offset > 0) {
 				uint64_t cur_pgd_va = 0;
 				if (hmkpm_copy_from_kernel_nofault(&cur_pgd_va, (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset), sizeof(cur_pgd_va)) == 0 && cur_pgd_va) {
 					uint64_t cur_pgd_pa = pgt_virt_to_phys(cur_pgd_va);
@@ -260,14 +249,6 @@ static inline unsigned long hmkpm_copy_to_user(void __user *to, const void *from
 {
 	uint64_t flags = hmkpm_uaccess_enable();
 	unsigned long ret = kfunc(__arch_copy_to_user)(to, from, n);
-	hmkpm_uaccess_disable(flags);
-	return ret;
-}
-
-static inline unsigned long hmkpm_copy_from_user(void *to, const void __user *from, unsigned long n)
-{
-	uint64_t flags = hmkpm_uaccess_enable();
-	unsigned long ret = kfunc(__arch_copy_from_user)(to, from, n);
 	hmkpm_uaccess_disable(flags);
 	return ret;
 }
@@ -307,7 +288,6 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write)
 	uint64_t table_va, pxd_bits, pxd_ptrs;
 	int64_t start, lv;
 	
-    // 【修复点】：去掉对 pgd 的 validate_virt_range 检查，它是内核地址
 	if (!pgd || (pgd & pgt_pgd_align_mask)) return 0;
 	va = pgt_untag_user_va(va);
 	if (va >> pgt_va_bits) return 0;
@@ -339,7 +319,7 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write)
 
 		if (lv == 3) {
 			uint64_t base;
-			if (type != 3ULL || (is_write && (desc & (1ULL << 7)) && !(desc & (1ULL << 51)))) return 0;
+			if (type != 3ULL) return 0;
 			base = pgt_desc_to_phys(desc);
 			if ((base & (pgt_page_size - 1)) || validate_phys_range(base, pgt_page_size)) return 0;
 			return base | (va & (pgt_page_size - 1));
@@ -347,7 +327,7 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write)
 
 		if (type == 1ULL) {
 			uint64_t block_bits, block_size, block_mask, base;
-			if (!pgt_block_allowed((int)lv) || (is_write && (desc & (1ULL << 7)) && !(desc & (1ULL << 51)))) return 0;
+			if (!pgt_block_allowed((int)lv)) return 0;
 			block_bits = (uint64_t)(3 - lv) * pxd_bits + pgt_page_shift;
 			if (block_bits >= 64) return 0;
 			block_size = 1ULL << block_bits;
@@ -357,7 +337,6 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write)
 			return (base & ~block_mask) | (va & block_mask);
 		}
 
-		if (is_write && (desc & (1ULL << 62))) return 0;
 		uint64_t next_pa = pgt_desc_to_phys(desc);
 		if ((next_pa & (pgt_page_size - 1)) || validate_phys_range(next_pa, pgt_page_size)) return 0;
 		table_va = pgt_phys_to_virt(next_pa);
@@ -404,8 +383,8 @@ static int pgt_pgtable_init(void)
 	} else { pgt_pgd_size = pgt_page_size; pgt_pgd_align_mask = pgt_page_size - 1; }
 
 	if (kver >= VERSION(5, 4, 0)) { pgt_pgd_size = pgt_page_size; pgt_pgd_align_mask = pgt_page_size - 1; }
-
-    // 【修复点】：5.10 内核 PAGE_OFFSET 计算修正，必须 -1
+	
+    // 5.10 内核 PAGE_OFFSET 修正
 	if (kver >= VERSION(4, 6, 0)) pgt_page_offset = -(UL(1) << (va1_bits - 1));
 	else pgt_page_offset = -(UL(1) << va1_bits);
 
@@ -424,33 +403,13 @@ static int pgt_pgtable_init(void)
 	return 0;
 }
 
-static inline int hmkpm_user_range_ok(const void __user *ptr, uint64_t len)
-{
-	uint64_t u;
-	if (!ptr || len == 0) return 0;
-	u = pgt_untag_user_va((uint64_t)ptr);
-	if (u > pgt_user_limit) return 0;
-	if (len - 1 > pgt_user_limit - u) return 0;
-	return 1;
-}
-
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define HMKPM_BOUNCE_SIZE 512U
-
-static inline void hmkpm_fast_copy(void *dst, const void *src, size_t n)
-{
-	uint8_t *d = (uint8_t *)dst;
-	const uint8_t *s = (const uint8_t *)src;
-	while (n >= 8 && !(((uintptr_t)d | (uintptr_t)s) & 7)) { *(uint64_t *)d = *(const uint64_t *)s; d += 8; s += 8; n -= 8; }
-	while (n >= 4 && !(((uintptr_t)d | (uintptr_t)s) & 3)) { *(uint32_t *)d = *(const uint32_t *)s; d += 4; s += 4; n -= 4; }
-	while (n > 0) { *d++ = *s++; n--; }
-}
 
 static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, void *local_buf, bool is_write)
 {
 	ssize_t total = 0;
 	uint64_t pgd = 0;
-	uint8_t bounce[HMKPM_BOUNCE_SIZE];
 
 	if (!mm || is_write) return -EOPNOTSUPP; 
 	if (mm_struct_offset.pgd_offset <= 0) return -EINVAL;
@@ -471,7 +430,11 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 		}
 
 		void *tkva = (void *)pgt_phys_to_virt(tkpa);
-		hmkpm_fast_copy((uint8_t *)local_buf + total, tkva, chunk);
+		if (!tkva) return -EFAULT;
+		
+        // 使用最安全的内核安全拷贝
+        if (hmkpm_copy_from_kernel_nofault((uint8_t *)local_buf + total, tkva, chunk) != 0)
+            return -EFAULT;
 
 		total += (ssize_t)chunk;
 		remote_va += chunk;
@@ -543,7 +506,10 @@ static void netlink_recv(struct sk_buff *skb) {
     if (nlh->nlmsg_type == HMKPM_NL_CMD_READ) {
         if (req->pid > 0) {
             uintptr_t clean_buf = (uintptr_t)req->user_buf & 0x00FFFFFFFFFFFFFFULL;
+            // 使用 uaccess 安全写入用户态缓冲区（必须切 ttbr0，否则会 panic）
+            uint64_t flags = hmkpm_uaccess_enable();
             ssize_t r = pgt_rw((pid_t)req->pid, req->addr, req->size, (void *)clean_buf, false);
+            hmkpm_uaccess_disable(flags);
             result = (r == req->size) ? 0 : (uint64_t)-1;
         }
     } 
@@ -558,7 +524,6 @@ static void netlink_recv(struct sk_buff *skb) {
 
             if (mm) {
                 uint64_t arg_start = 0;
-                // MM_ARG_START_OFFSET = 0x130 (5.10 GKI)
                 hmkpm_copy_from_kernel_nofault(&arg_start, (const void *)((uintptr_t)mm + MM_ARG_START_OFFSET), 8);
                 if (arg_start) {
                     char kbuf[128] = {0};
@@ -583,37 +548,32 @@ static void netlink_recv(struct sk_buff *skb) {
 
         if (mm) {
             uintptr_t vma = 0;
-            // MM_MMAP_OFFSET = 0x00 (5.10 GKI)
             hmkpm_copy_from_kernel_nofault(&vma, (const void *)((uintptr_t)mm + MM_MMAP_OFFSET), 8);
             
             while (vma) {
                 uintptr_t file = 0;
-                // VMA_VM_FILE_OFFSET = 0x80 (5.10 GKI)
                 hmkpm_copy_from_kernel_nofault(&file, (const void *)(vma + VMA_VM_FILE_OFFSET), 8);
                 
                 if (file) {
                     uintptr_t dentry = 0;
-                    // FILE_F_PATH_DENTRY_OFFSET = 0x18 (5.10 GKI)
                     hmkpm_copy_from_kernel_nofault(&dentry, (const void *)(file + FILE_F_PATH_DENTRY_OFFSET), 8);
                     
                     if (dentry) {
                         char *name_ptr = NULL;
-                        // DENTRY_D_NAME_NAME_OFFSET = 0x38 (5.10 GKI)
                         hmkpm_copy_from_kernel_nofault(&name_ptr, (const void *)(dentry + DENTRY_D_NAME_NAME_OFFSET), 8);
                         
                         if (name_ptr) {
                             char iname[64] = {0};
-                            hmkpm_copy_from_kernel_nofault(iname, name_ptr, 63);
-                            if (hmkpm_strstr(iname, req->mod_name)) { 
-                                // VMA_VM_START_OFFSET = 0x00
-                                hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + VMA_VM_START_OFFSET), 8);
-                                break; 
+                            if (hmkpm_copy_from_kernel_nofault(iname, name_ptr, 63) == 0) {
+                                if (hmkpm_strstr(iname, req->mod_name)) { 
+                                    hmkpm_copy_from_kernel_nofault(&result, (const void *)(vma + VMA_VM_START_OFFSET), 8);
+                                    break; 
+                                }
                             }
                         }
                     }
                 }
                 uintptr_t next_vma = 0;
-                // VMA_VM_NEXT_OFFSET = 0xA0 (5.10 GKI) 
                 hmkpm_copy_from_kernel_nofault(&next_vma, (const void *)(vma + VMA_VM_NEXT_OFFSET), 8);
                 vma = next_vma;
             }
@@ -636,7 +596,6 @@ static void netlink_recv(struct sk_buff *skb) {
 static int netlink_init(void) {
     kf_netlink_create = (void*)hmkpm_lookup_symbol("__netlink_kernel_create");
     if (!kf_netlink_create) kf_netlink_create = (void*)hmkpm_lookup_symbol("netlink_kernel_create");
-
     kf_netlink_unicast = (void*)hmkpm_lookup_symbol("netlink_unicast");
     kf_alloc_skb = (void*)hmkpm_lookup_symbol("__alloc_skb");
     kf_skb_put = (void*)hmkpm_lookup_symbol("skb_put");
@@ -660,9 +619,7 @@ static int netlink_init(void) {
 static long module_init_handler(const char *args, const char *event, void *__user reserved)
 {
 	hook_err_t err;
-
 	if (kver < VERSION(4, 0, 0) || kver >= VERSION(6, 13, 0)) return -EINVAL;
-
 	if (pgt_pgtable_init() != 0) return -ENOENT;
 	hmkpm_sw_pan_init();
 
