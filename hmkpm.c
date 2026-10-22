@@ -27,11 +27,11 @@
 
 #define HMKPM_VERSION_MAJOR	2
 #define HMKPM_VERSION_MINOR	9
-#define HMKPM_VERSION_PATCH	0
+#define HMKPM_VERSION_PATCH	1
 #define HMKPM_VERSION_CODE	(((uint32_t)HMKPM_VERSION_MAJOR << 16) | \
 				 ((uint32_t)HMKPM_VERSION_MINOR << 8) | \
 				 ((uint32_t)HMKPM_VERSION_PATCH))
-#define HMKPM_VERSION_STR	"2.9.0-ro"
+#define HMKPM_VERSION_STR	"2.9.1-ro"
 
 KPM_NAME("HMKPM");
 KPM_VERSION(HMKPM_VERSION_STR);
@@ -51,8 +51,6 @@ struct inode;
 // gki 5.10 to 6.12 same offset
 #define SUPER_BLOCK_OFF 40
 #define MAGIC_OFF 96
-
-struct rw_semaphore;
 
 #define U64_MAX				((u64)~0ULL)
 #define HMKPM_TAG			"[HMKPM] "
@@ -181,15 +179,6 @@ static void before_fsnotify(hook_fargs7_t *args, void *udata)
 
 /* ========================================================================
  * Channel: getresuid, intercepted when arg0 == HMKPM_MAGIC.
- *
- *   arg0 = HMKPM_MAGIC / HMKPM_MAGIC_READ / HMKPM_MAGIC_READ_BATCH / ...
- *   arg1 = pointer to request buffer
- *   arg2 = total buffer size
- *
- * Layouts in userspace:
- *   Single: [ hmkpm_req (pid, addr, size) | data[size] ]
- *   Batch:  [ hmkpm_batch_hdr (pid, count, data_total) |
- *             hmkpm_batch_entry[count] | data[data_total] ]
  * ======================================================================== */
 
 #define HMKPM_MAGIC			0x484D4B504DULL /* "HMKPM" */
@@ -200,20 +189,21 @@ static void before_fsnotify(hook_fargs7_t *args, void *udata)
 /* Feature Flags */
 #define HMKPM_FEATURE_READ		(1ULL << 0)
 #define HMKPM_FEATURE_READ_BATCH	(1ULL << 2)
-#define HMKPM_ALL_FEATURES		(HMKPM_FEATURE_READ | HMKPM_FEATURE_READ_BATCH)
+#define HMKPM_FEATURE_LOCKLESS		(1ULL << 6)
+#define HMKPM_ALL_FEATURES		(HMKPM_FEATURE_READ | HMKPM_FEATURE_READ_BATCH | HMKPM_FEATURE_LOCKLESS)
 
 /* Probe & Version Information */
 struct hmkpm_version_info {
-	uint64_t magic;            /* HMKPM_MAGIC */
-	uint32_t version_code;     /* (major << 16) | (minor << 8) | patch */
-	uint16_t version_major;
-	uint16_t version_minor;
-	uint16_t version_patch;
-	uint8_t  is_lockless;
+	uint64_t magic;            
+	uint32_t version_code;     
+	uint16_t version_major;    
+	uint16_t version_minor;    
+	uint16_t version_patch;    
+	uint8_t  is_lockless;      
 	uint8_t  _pad;
-	int32_t  mmap_lock_offset;  /* -1 in read-only build */
-	uint64_t features;
-	char version_str[16];
+	int32_t  mmap_lock_offset; 
+	uint64_t features;         
+	char version_str[16];      
 };
 
 #define HMKPM_BATCH_CHUNK_ENTRIES	64U
@@ -247,8 +237,10 @@ struct hmkpm_req {
 
 static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, size_t size)
 {
-	kfunc_call(copy_from_kernel_nofault, dst, src, size);
-	kfunc_call(probe_kernel_read, dst, src, size);
+	if (kf_copy_from_kernel_nofault)
+		return kfunc(copy_from_kernel_nofault)(dst, src, size);
+	if (kf_probe_kernel_read)
+		return kfunc(probe_kernel_read)(dst, src, size);
 	return -ENOSYS;
 }
 
@@ -277,7 +269,7 @@ static inline uint64_t pgt_virt_to_phys(uint64_t addr)
 }
 
 /* ========================================================================
- * Software PAN (CONFIG_ARM64_SW_TTBR0_PAN) Support
+ * Software PAN Support
  * ======================================================================== */
 
 static bool sw_pan_enabled = false;
@@ -726,7 +718,6 @@ static inline void hmkpm_fast_copy(void *dst, const void *src, size_t n)
 	}
 }
 
-/* Read-only memory access: copies from remote VA to local userspace buffer */
 static ssize_t pgt_read_mm(struct mm_struct *mm, uint64_t remote_va, size_t len,
 			   void __user *local_buf)
 {
@@ -1057,16 +1048,16 @@ static void hmkpm_handle(hook_fargs3_t *args, void *udata)
 		if (user_ptr && total_len > 0) {
 			if (hmkpm_user_range_ok(user_ptr, total_len)) {
 				struct hmkpm_version_info info;
-				kfunc(memset)(&info, 0, sizeof(info));
+				memset(&info, 0, sizeof(info)); // 使用本地 memset 避免符号解析问题
 				info.magic = HMKPM_MAGIC;
 				info.version_code = HMKPM_VERSION_CODE;
 				info.version_major = HMKPM_VERSION_MAJOR;
 				info.version_minor = HMKPM_VERSION_MINOR;
 				info.version_patch = HMKPM_VERSION_PATCH;
-				info.is_lockless = 1;	/* read-only build is always lockless */
+				info.is_lockless = 1;
 				info._pad = 0;
 				info.mmap_lock_offset = -1;
-				info.features = HMKPM_ALL_FEATURES | (1ULL << 6); /* LOCKLESS */
+				info.features = HMKPM_ALL_FEATURES;
 
 				const char *vstr = HMKPM_VERSION_STR;
 				size_t vlen = 0;
@@ -1137,28 +1128,28 @@ static long module_init_handler(const char *args, const char *event, void *__use
 	hmkpm_sw_pan_init();
 
 	static const char *const arm64_memset_aliases[] = {
-        "__memset",
-        "memset",
-        "__pi___memset",
-        "__pi_memset",
-        "__asan_memset",
-        "__hwasan_memset",
-        "__mte_memset",
-        "__arch_memset",
-        NULL
-    };
+		"__memset",
+		"memset",
+		"__pi___memset",
+		"__pi_memset",
+		"__asan_memset",
+		"__hwasan_memset",
+		"__mte_memset",
+		"__arch_memset",
+		NULL
+	};
 
-    for (int i = 0; arm64_memset_aliases[i] != NULL; i++) {
-        kf_memset = (typeof(kf_memset))hmkpm_lookup_symbol(arm64_memset_aliases[i]);
-        if (kf_memset) {
-            hmkpm_info("Resolved memset via symbol: %s (at %lx)\n", arm64_memset_aliases[i], kf_memset);
-            break;
-        }
+	for (int i = 0; arm64_memset_aliases[i] != NULL; i++) {
+		kf_memset = (typeof(kf_memset))hmkpm_lookup_symbol(arm64_memset_aliases[i]);
+		if (kf_memset) {
+			hmkpm_info("Resolved memset via symbol: %s\n", arm64_memset_aliases[i]);
+			break;
+		}
 	}
 
+	// 容错处理：如果找不到也没关系，我们用本地的
 	if (!kf_memset) {
-		hmkpm_error("Failed to find kfunc memset\n");
-		init_error = true;
+		hmkpm_warn("Kernel memset symbol not found, using local inline fallback\n");
 	}
 
 	kf___arch_copy_to_user =
@@ -1193,7 +1184,11 @@ static long module_init_handler(const char *args, const char *event, void *__use
 		(typeof(kf_copy_from_kernel_nofault))hmkpm_lookup_symbol("copy_from_kernel_nofault");
 	if (!kf_copy_from_kernel_nofault) {
 		hmkpm_info("Failed to find kfunc copy_from_kernel_nofault, using probe_kernel_read instead\n");
-		hkfunc_match(probe_kernel_read);
+		kf_probe_kernel_read = (typeof(kf_probe_kernel_read))hmkpm_lookup_symbol("probe_kernel_read");
+		if (!kf_probe_kernel_read) {
+			hmkpm_error("Failed to find kfunc probe_kernel_read either!\n");
+			init_error = true;
+		}
 	}
 
 	if (init_error) {
